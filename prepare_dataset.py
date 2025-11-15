@@ -53,7 +53,7 @@ try:
 except ImportError:  # pragma: no cover - guard for environments without pandas
     pd = None  # type: ignore[assignment]
 
-DATE_PATTERN = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
+DATE_PATTERN = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$")
 MAGNITUDE_SUFFIXES = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
 BOOL_MAP = {"yes": 1.0, "no": 0.0}
 TARGET_COLUMN_INDEX = {4: 48, 13: 49, 26: 50}
@@ -112,7 +112,7 @@ def _coerce_numeric(value) -> float:
 
 
 def _parse_snapshot_date(path: Path) -> Optional[dt.date]:
-    match = DATE_PATTERN.search(path.name)
+    match = DATE_PATTERN.match(path.stem)
     if not match:
         return None
     day, month, year = map(int, match.groups())
