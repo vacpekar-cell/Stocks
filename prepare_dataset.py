@@ -44,6 +44,7 @@ import datetime as dt
 import logging
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -54,6 +55,8 @@ except ImportError:  # pragma: no cover - guard for environments without pandas
     pd = None  # type: ignore[assignment]
 
 RELAXED_DATE_PATTERN = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:[ _-].*)?$")
+TICKER_COLUMN_INDEX = 2  # according to the original Finviz export layout
+OPTIONAL_COLUMN_KEYWORDS = ("sector", "industry")
 MAGNITUDE_SUFFIXES = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
 BOOL_MAP = {"yes": 1.0, "no": 0.0}
 TARGET_COLUMN_INDEX = {4: 48, 13: 49, 26: 50}
@@ -141,18 +144,8 @@ def _parse_snapshot_date(path: Path) -> Optional[dt.date]:
 
 
 def _normalize_header(value: object) -> str:
-    return str(value).strip().lower()
-
-
-def _detect_ticker_column(columns: Sequence[str]) -> Optional[str]:
-    """Return the column whose header indicates it stores ticker symbols."""
-
-    normalized_targets = {"ticker", "ticker symbol", "symbol"}
-    for name in columns:
-        normalized = _normalize_header(name)
-        if normalized in normalized_targets or "ticker" in normalized:
-            return name
-    return None
+    text = str(value).replace("\xa0", " ")
+    return text.strip().lower()
 
 
 def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
@@ -167,9 +160,11 @@ def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
     # remaining columns keep the original numbering expected by the node
     # specification.
     columns = list(df.columns)
-    drop_candidates = [
-        name for name in columns if _normalize_header(name) in {"sector", "industry"}
-    ]
+    drop_candidates = []
+    for name in columns:
+        normalized = _normalize_header(name)
+        if any(keyword in normalized.replace(" ", "") for keyword in OPTIONAL_COLUMN_KEYWORDS):
+            drop_candidates.append(name)
     if drop_candidates:
         df = df.drop(columns=drop_candidates)
         columns = list(df.columns)
@@ -177,15 +172,15 @@ def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
     if df.shape[1] < 80:
         raise SnapshotFormatError(f"Soubor '{path.name}' musí obsahovat alespoň 80 sloupců.")
 
-    ticker_col = _detect_ticker_column(df.columns)
-    if ticker_col is None:
-        if len(df.columns) < 2:
-            raise SnapshotFormatError(
-                f"Soubor '{path.name}' musí obsahovat sloupec s ticker symboly."
-            )
-        ticker_col = df.columns[1]
+    if len(df.columns) < TICKER_COLUMN_INDEX:
+        raise SnapshotFormatError(
+            f"Soubor '{path.name}' musí obsahovat alespoň {TICKER_COLUMN_INDEX} sloupce."
+        )
+    ticker_col = df.columns[TICKER_COLUMN_INDEX - 1]
+    normalized_ticker = _normalize_header(ticker_col)
+    if "ticker" not in normalized_ticker:
         logging.debug(
-            "%s – nenašel jsem sloupec s názvem 'Ticker', používám druhý sloupec (%s)",
+            "%s – druhý sloupec (%s) neobsahuje text 'Ticker', přesto ho používám jako identifikátor.",
             path.name,
             ticker_col,
         )
@@ -496,6 +491,8 @@ def build_dataset(
         snapshot_current_fail = 0
         snapshot_lookback_fail = 0
         snapshot_target_fail = 0
+        snapshot_current_node_failures: Counter[int] = Counter()
+        snapshot_lookback_node_failures: Counter[int] = Counter()
 
         for ticker in sorted(tickers):
             current_row = snapshot.df.loc[ticker]
@@ -507,6 +504,7 @@ def build_dataset(
                 snapshot_current_fail += 1
                 if current_nodes.failed_node:
                     node_failure_counts["current"][current_nodes.failed_node] += 1
+                    snapshot_current_node_failures[current_nodes.failed_node] += 1
                 continue
 
             lookback_nodes = _compute_nodes(lookback_row, lookback_snapshot.columns)
@@ -515,6 +513,7 @@ def build_dataset(
                 snapshot_lookback_fail += 1
                 if lookback_nodes.failed_node:
                     node_failure_counts["lookback"][lookback_nodes.failed_node] += 1
+                    snapshot_lookback_node_failures[lookback_nodes.failed_node] += 1
                 continue
 
             targets: Dict[int, float] = {}
@@ -549,14 +548,18 @@ def build_dataset(
             snapshot_success += 1
 
         if snapshot_success == 0:
+            current_details = _format_node_failures(snapshot_current_node_failures)
+            lookback_details = _format_node_failures(snapshot_lookback_node_failures)
             logging.warning(
-                "%s (%s) – žádné platné tickery (společné: %s, aktuální selhaly: %s, starší selhaly: %s, cíle selhaly: %s).",
+                "%s (%s) – žádné použitelné řádky (společné tickery: %s, aktuální selhaly: %s, starší selhaly: %s, cíle selhaly: %s, nejčastější aktuální uzly: %s, nejčastější starší uzly: %s).",
                 snapshot.path.name,
                 snapshot.date.isoformat(),
                 shared_tickers,
                 snapshot_current_fail,
                 snapshot_lookback_fail,
                 snapshot_target_fail,
+                current_details,
+                lookback_details,
             )
 
     if not feature_rows:
