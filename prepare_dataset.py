@@ -68,6 +68,10 @@ class Snapshot:
     columns: List[str]
 
 
+class SnapshotFormatError(ValueError):
+    """Raised when a snapshot file is missing required columns or formatting."""
+
+
 # -------------------------------------------------------------------------------------- helpers
 
 def _coerce_numeric(value) -> float:
@@ -126,7 +130,7 @@ def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
     df = df.dropna(how="all")
 
     if df.shape[1] < 80:
-        raise ValueError(f"Soubor '{path}' musí obsahovat alespoň 80 sloupců.")
+        raise SnapshotFormatError(f"Soubor '{path.name}' musí obsahovat alespoň 80 sloupců.")
 
     ticker_col = df.columns[1]
     df = df.rename(columns={ticker_col: "Ticker"})
@@ -287,9 +291,25 @@ def build_dataset(
     snapshot_entries.sort(key=lambda item: item[0])
 
     snapshots: List[Snapshot] = []
+    skipped_snapshots: List[str] = []
     for snap_date, snap_path in snapshot_entries:
-        df, columns = _load_snapshot(snap_path)
+        try:
+            df, columns = _load_snapshot(snap_path)
+        except SnapshotFormatError as exc:
+            skipped_snapshots.append(f"{snap_path.name}: {exc}")
+            logging.warning("Přeskakuji %s – %s", snap_path.name, exc)
+            continue
+        except Exception as exc:  # pragma: no cover - unexpected read errors
+            skipped_snapshots.append(f"{snap_path.name}: {exc}")
+            logging.warning("Přeskakuji %s – nepodařilo se načíst (%s)", snap_path.name, exc)
+            continue
         snapshots.append(Snapshot(date=snap_date, path=snap_path, df=df, columns=columns))
+
+    if len(snapshots) < 2:
+        reason = "Nepodařilo se načíst dostatek snapshotů."
+        if skipped_snapshots:
+            reason += " Problémové soubory: " + "; ".join(skipped_snapshots)
+        raise RuntimeError(reason)
 
     feature_rows: List[List[float]] = []
     target_rows: List[List[float]] = []
