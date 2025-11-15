@@ -53,8 +53,7 @@ try:
 except ImportError:  # pragma: no cover - guard for environments without pandas
     pd = None  # type: ignore[assignment]
 
-STRICT_DATE_PATTERN = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
-RELAXED_DATE_PATTERN = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$")
+RELAXED_DATE_PATTERN = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:[ _-].*)?$")
 MAGNITUDE_SUFFIXES = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
 BOOL_MAP = {"yes": 1.0, "no": 0.0}
 TARGET_COLUMN_INDEX = {4: 48, 13: 49, 26: 50}
@@ -114,7 +113,8 @@ def _coerce_numeric(value) -> float:
 
 
 def _parse_snapshot_date(path: Path) -> Optional[dt.date]:
-    match = RELAXED_DATE_PATTERN.match(path.stem)
+    stem = path.stem
+    match = RELAXED_DATE_PATTERN.match(stem)
     if not match:
         return None
     day, month, year = map(int, match.groups())
@@ -123,11 +123,12 @@ def _parse_snapshot_date(path: Path) -> Optional[dt.date]:
     except ValueError:
         return None
 
-    if not STRICT_DATE_PATTERN.match(path.stem):
+    canonical_name = snap_date.strftime("%d.%m.%Y")
+    if stem != canonical_name:
         logging.info(
-            "Soubor %s interpretován jako %s (doplněny úvodní nuly)",
+            "Soubor %s interpretován jako %s (upraven název)",
             path.name,
-            snap_date.strftime("%d.%m.%Y"),
+            canonical_name,
         )
 
     return snap_date
