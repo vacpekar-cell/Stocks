@@ -73,6 +73,12 @@ class SnapshotFormatError(ValueError):
     """Raised when a snapshot file is missing required columns or formatting."""
 
 
+@dataclass
+class NodeComputation:
+    values: Optional[List[float]]
+    failed_node: Optional[int] = None
+
+
 # -------------------------------------------------------------------------------------- helpers
 
 def _coerce_numeric(value) -> float:
@@ -236,6 +242,13 @@ def _log_missing_neighbor(
     )
 
 
+def _format_node_failures(counts: Dict[int, int]) -> str:
+    items = sorted(((idx, cnt) for idx, cnt in counts.items() if cnt), key=lambda item: item[1], reverse=True)
+    if not items:
+        return "žádné chyby"
+    return ", ".join(f"node_{idx:02d}: {cnt}" for idx, cnt in items)
+
+
 def _row_value(row: "pd.Series", columns: List[str], column_index: int) -> float:
     try:
         col_name = columns[column_index - 1]
@@ -244,7 +257,7 @@ def _row_value(row: "pd.Series", columns: List[str], column_index: int) -> float
     return _coerce_numeric(row[col_name])
 
 
-def _compute_nodes(row: "pd.Series", columns: List[str]) -> Optional[List[float]]:
+def _compute_nodes(row: "pd.Series", columns: List[str]) -> NodeComputation:
     cache: Dict[int, float] = {}
 
     def col(idx: int) -> float:
@@ -318,10 +331,11 @@ def _compute_nodes(row: "pd.Series", columns: List[str]) -> Optional[List[float]
         ratio(75, 80),
     ]
 
-    if any(math.isnan(value) or math.isinf(value) for value in nodes):
-        return None
+    for idx, value in enumerate(nodes, start=1):
+        if math.isnan(value) or math.isinf(value):
+            return NodeComputation(values=None, failed_node=idx)
 
-    return nodes
+    return NodeComputation(values=nodes)
 
 
 def _extract_target(
@@ -370,6 +384,31 @@ def build_dataset(
             reason += " Problémové soubory: " + "; ".join(skipped_snapshots)
         raise RuntimeError(reason)
 
+    snapshots_by_date: Dict[dt.date, List[Snapshot]] = {}
+    for snapshot in snapshots:
+        snapshots_by_date.setdefault(snapshot.date, []).append(snapshot)
+
+    canonical_snapshots: List[Snapshot] = []
+    for snap_date in sorted(snapshots_by_date):
+        candidates = snapshots_by_date[snap_date]
+        if len(candidates) > 1:
+            candidates.sort(
+                key=lambda snap: (snap.df.shape[0], snap.df.shape[1], snap.path.name),
+                reverse=True,
+            )
+            chosen = candidates[0]
+            logging.info(
+                "%s – nalezeno %s souborů, používám %s",
+                snap_date.isoformat(),
+                len(candidates),
+                chosen.path.name,
+            )
+        else:
+            chosen = candidates[0]
+        canonical_snapshots.append(chosen)
+
+    snapshots = canonical_snapshots
+
     feature_rows: List[List[float]] = []
     target_rows: List[List[float]] = []
     metadata_rows: List[Dict[str, str]] = []
@@ -386,6 +425,11 @@ def build_dataset(
         "lookback_nodes": 0,
         "targets": 0,
     }
+    node_failure_counts = {
+        "current": {i: 0 for i in range(1, NODE_COUNT + 1)},
+        "lookback": {i: 0 for i in range(1, NODE_COUNT + 1)},
+    }
+    target_failure_counts = {weeks: 0 for weeks in TARGET_COLUMN_INDEX}
 
     for idx, snapshot in enumerate(snapshots):
         if focus_date and snapshot.date != focus_date:
@@ -425,18 +469,30 @@ def build_dataset(
             logging.warning("%s (%s) – žádné společné tickery se všemi snapshoty.", snapshot.path.name, snapshot.date.isoformat())
             continue
 
+        shared_tickers = len(tickers)
+        snapshot_success = 0
+        snapshot_current_fail = 0
+        snapshot_lookback_fail = 0
+        snapshot_target_fail = 0
+
         for ticker in sorted(tickers):
             current_row = snapshot.df.loc[ticker]
             lookback_row = lookback_snapshot.df.loc[ticker]
 
             current_nodes = _compute_nodes(current_row, snapshot.columns)
-            if current_nodes is None:
+            if current_nodes.values is None:
                 ticker_skip_counts["current_nodes"] += 1
+                snapshot_current_fail += 1
+                if current_nodes.failed_node:
+                    node_failure_counts["current"][current_nodes.failed_node] += 1
                 continue
 
             lookback_nodes = _compute_nodes(lookback_row, lookback_snapshot.columns)
-            if lookback_nodes is None:
+            if lookback_nodes.values is None:
                 ticker_skip_counts["lookback_nodes"] += 1
+                snapshot_lookback_fail += 1
+                if lookback_nodes.failed_node:
+                    node_failure_counts["lookback"][lookback_nodes.failed_node] += 1
                 continue
 
             targets: Dict[int, float] = {}
@@ -447,14 +503,16 @@ def build_dataset(
                 value = _extract_target(future_row, future_snapshot.columns, column_index)
                 if value is None:
                     target_valid = False
+                    target_failure_counts[weeks] += 1
                     break
                 targets[weeks] = value
 
             if not target_valid:
                 ticker_skip_counts["targets"] += 1
+                snapshot_target_fail += 1
                 continue
 
-            feature_rows.append(current_nodes + lookback_nodes)
+            feature_rows.append(current_nodes.values + lookback_nodes.values)
             target_rows.append([targets[4], targets[13], targets[26]])
             metadata_rows.append(
                 {
@@ -465,6 +523,18 @@ def build_dataset(
                     "target_13w_snapshot": future_snapshots[13].date.isoformat(),
                     "target_26w_snapshot": future_snapshots[26].date.isoformat(),
                 }
+            )
+            snapshot_success += 1
+
+        if snapshot_success == 0:
+            logging.warning(
+                "%s (%s) – žádné platné tickery (společné: %s, aktuální selhaly: %s, starší selhaly: %s, cíle selhaly: %s).",
+                snapshot.path.name,
+                snapshot.date.isoformat(),
+                shared_tickers,
+                snapshot_current_fail,
+                snapshot_lookback_fail,
+                snapshot_target_fail,
             )
 
     if not feature_rows:
@@ -499,6 +569,20 @@ def build_dataset(
         ticker_skip_counts["current_nodes"],
         ticker_skip_counts["lookback_nodes"],
         ticker_skip_counts["targets"],
+    )
+    logging.info(
+        "Diagnostika uzlů (aktuální) – %s",
+        _format_node_failures(node_failure_counts["current"]),
+    )
+    logging.info(
+        "Diagnostika uzlů (starší) – %s",
+        _format_node_failures(node_failure_counts["lookback"]),
+    )
+    logging.info(
+        "Diagnostika cílů – 4t: %s, 13t: %s, 26t: %s",
+        target_failure_counts[4],
+        target_failure_counts[13],
+        target_failure_counts[26],
     )
 
     return features_df, targets_df, metadata_df
