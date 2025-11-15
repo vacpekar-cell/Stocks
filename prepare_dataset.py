@@ -61,6 +61,7 @@ BOOL_MAP = {"yes": 1.0, "no": 0.0}
 TARGET_COLUMN_INDEX = {4: 48, 13: 49, 26: 50}
 WEEKEND_TOLERANCE_DAYS = 2  # allow Saturday/Sunday captures to pair with Friday baselines
 NODE_COUNT = 33
+NEW_FORMAT_START = dt.date(2024, 8, 16)
 
 
 @dataclass
@@ -143,23 +144,7 @@ def _parse_snapshot_date(path: Path) -> Optional[dt.date]:
     return snap_date
 
 
-def _normalize_header(value: object) -> str:
-    text = str(value).replace("\xa0", " ")
-    return text.strip().lower()
-
-
-def _has_new_format(columns: Sequence[str]) -> bool:
-    """Detect whether the snapshot contains the Sector/Industry columns."""
-
-    if len(columns) < 4:
-        return False
-
-    third = _normalize_header(columns[2])
-    fourth = _normalize_header(columns[3])
-    return third == "sector" and fourth == "industry"
-
-
-def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str], int]:
+def _load_snapshot(path: Path, snap_date: dt.date) -> Tuple["pd.DataFrame", List[str], int]:
     if pd is None:
         raise SystemExit("pandas is required. Install it via 'pip install pandas openpyxl'.")
 
@@ -167,7 +152,7 @@ def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str], int]:
     df = df.dropna(how="all")
 
     columns = list(df.columns)
-    column_offset = 2 if _has_new_format(columns) else 0
+    column_offset = 2 if snap_date >= NEW_FORMAT_START else 0
     required_columns = 80 + column_offset
     if df.shape[1] < required_columns:
         raise SnapshotFormatError(
@@ -179,13 +164,6 @@ def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str], int]:
             f"Soubor '{path.name}' musí obsahovat alespoň {TICKER_COLUMN_INDEX} sloupce."
         )
     ticker_col = df.columns[TICKER_COLUMN_INDEX - 1]
-    normalized_ticker = _normalize_header(ticker_col)
-    if "ticker" not in normalized_ticker:
-        logging.debug(
-            "%s – druhý sloupec (%s) neobsahuje text 'Ticker', přesto ho používám jako identifikátor.",
-            path.name,
-            ticker_col,
-        )
     df = df.rename(columns={ticker_col: "Ticker"})
     df["Ticker"] = df["Ticker"].astype(str).str.strip()
     df = df[df["Ticker"] != ""]
@@ -391,7 +369,7 @@ def build_dataset(
     skipped_snapshots: List[str] = []
     for snap_date, snap_path in snapshot_entries:
         try:
-            df, columns, column_offset = _load_snapshot(snap_path)
+            df, columns, column_offset = _load_snapshot(snap_path, snap_date)
         except SnapshotFormatError as exc:
             skipped_snapshots.append(f"{snap_path.name}: {exc}")
             logging.warning("Přeskakuji %s – %s", snap_path.name, exc)
