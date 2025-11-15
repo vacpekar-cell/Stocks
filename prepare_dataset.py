@@ -58,6 +58,7 @@ RELAXED_DATE_PATTERN = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$")
 MAGNITUDE_SUFFIXES = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
 BOOL_MAP = {"yes": 1.0, "no": 0.0}
 TARGET_COLUMN_INDEX = {4: 48, 13: 49, 26: 50}
+WEEKEND_TOLERANCE_DAYS = 2  # allow Saturday/Sunday captures to pair with Friday baselines
 NODE_COUNT = 33
 
 
@@ -173,6 +174,7 @@ def _find_neighbor_index(
     snapshots: Sequence[Snapshot],
     target_days: int,
     direction: int,
+    tolerance_days: int = WEEKEND_TOLERANCE_DAYS,
 ) -> Optional[int]:
     current_date = snapshots[current_idx].date
 
@@ -187,9 +189,9 @@ def _find_neighbor_index(
         delta = delta_fn(idx)
         if delta < 0:
             continue
-        if delta > target_days:
+        if delta > target_days + tolerance_days:
             break
-        if delta == target_days:
+        if abs(delta - target_days) <= tolerance_days:
             return idx
 
     return None
