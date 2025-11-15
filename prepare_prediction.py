@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 try:
     import pandas as pd
@@ -23,42 +23,78 @@ except ImportError:  # pragma: no cover - optional dependency guard
 import prepare_dataset as prep
 
 
-def _discover_snapshots(data_dir: Path) -> List[prep.Snapshot]:
+def _collect_dated_paths(data_dir: Path) -> List[Tuple[pd.Timestamp, Path]]:
+    """Return dated snapshot candidates while suppressing noisy info logs."""
+
     if pd is None:
         raise SystemExit("pandas is required. Install it via 'pip install pandas openpyxl'.")
-    entries: List[Tuple[pd.Timestamp, Path]] = []
-    for path in sorted(data_dir.glob("*.xls*")):
-        snap_date = prep._parse_snapshot_date(path)  # type: ignore[attr-defined]
-        if snap_date:
-            entries.append((pd.Timestamp(snap_date), path))
 
-    if not entries:
-        raise RuntimeError("Nebyl nalezen žádný snapshot soubor.")
+    entries: List[Tuple[pd.Timestamp, Path]] = []
+    previous_disable = logging.root.manager.disable
+    logging.disable(logging.INFO)
+    try:
+        for path in sorted(data_dir.glob("*.xls*")):
+            snap_date = prep._parse_snapshot_date(path)  # type: ignore[attr-defined]
+            if snap_date:
+                entries.append((pd.Timestamp(snap_date), path))
+    finally:
+        logging.disable(previous_disable)
 
     entries.sort(key=lambda item: item[0])
+    return entries
 
-    snapshots: List[prep.Snapshot] = []
-    by_date: dict[pd.Timestamp, List[prep.Snapshot]] = {}
-    for snap_ts, snap_path in entries:
-        snap_date = snap_ts.date()
+
+def _load_best_snapshot(date: pd.Timestamp, paths: List[Path]) -> prep.Snapshot:
+    """Load the richest snapshot for a given date, warning on format errors."""
+
+    candidates: List[prep.Snapshot] = []
+    for snap_path in paths:
         try:
-            df, columns, column_offset = prep._load_snapshot(snap_path, snap_date)  # type: ignore[attr-defined]
+            df, columns, column_offset = prep._load_snapshot(snap_path, date.date())  # type: ignore[attr-defined]
         except prep.SnapshotFormatError as exc:  # type: ignore[attr-defined]
             logging.warning("Přeskakuji %s – %s", snap_path.name, exc)
             continue
-        snap = prep.Snapshot(date=snap_date, path=snap_path, df=df, columns=columns, column_offset=column_offset)
-        by_date.setdefault(snap_ts, []).append(snap)
+        candidates.append(prep.Snapshot(date=date.date(), path=snap_path, df=df, columns=columns, column_offset=column_offset))
 
-    for snap_ts in sorted(by_date):
-        candidates = by_date[snap_ts]
-        if len(candidates) > 1:
-            candidates.sort(key=lambda snap: (snap.df.shape[0], snap.df.shape[1], snap.path.name), reverse=True)
-        snapshots.append(candidates[0])
+    if not candidates:
+        raise RuntimeError(f"Žádný snapshot {date.date().isoformat()} nešel načíst kvůli formátu.")
 
-    if not snapshots:
-        raise RuntimeError("Žádný snapshot nešel načíst kvůli chybě formátu.")
+    candidates.sort(key=lambda snap: (snap.df.shape[0], snap.df.shape[1], snap.path.name), reverse=True)
+    return candidates[0]
 
-    return snapshots
+
+def _discover_snapshots(data_dir: Path) -> List[prep.Snapshot]:
+    entries = _collect_dated_paths(data_dir)
+    if not entries:
+        raise RuntimeError("Nebyl nalezen žádný snapshot soubor.")
+
+    by_date: dict[pd.Timestamp, List[Path]] = {}
+    for snap_ts, snap_path in entries:
+        by_date.setdefault(snap_ts, []).append(snap_path)
+
+    newest_date = max(by_date)
+
+    lookback_date: Optional[pd.Timestamp] = None
+    best_delta = None
+    for candidate_date in by_date:
+        if candidate_date >= newest_date:
+            continue
+        delta = (newest_date - candidate_date).days
+        if abs(delta - 28) <= prep.WEEKEND_TOLERANCE_DAYS:  # type: ignore[attr-defined]
+            score = abs(delta - 28)
+            if best_delta is None or score < best_delta:
+                best_delta = score
+                lookback_date = candidate_date
+
+    if lookback_date is None:
+        raise RuntimeError(
+            f"Pro nejnovější snapshot {newest_date.date().isoformat()} nebyl nalezen soubor 4 týdny zpět."
+        )
+
+    newest_snap = _load_best_snapshot(newest_date, by_date[newest_date])
+    lookback_snap = _load_best_snapshot(lookback_date, by_date[lookback_date])
+
+    return [lookback_snap, newest_snap]
 
 
 def _current_and_lookback(snapshots: Sequence[prep.Snapshot]) -> Tuple[prep.Snapshot, prep.Snapshot]:
