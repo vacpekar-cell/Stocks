@@ -144,16 +144,17 @@ def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
     df = pd.read_excel(path, engine="openpyxl")
     df = df.dropna(how="all")
 
-    # Some newer exports inserted the "Sector" and "Industry" columns right after
-    # the ticker column. Remove them so that the remaining columns keep the
-    # original numbering expected by the node specification.
+    # Some newer exports inserted the "Sector" and "Industry" columns (typically
+    # near the ticker column). Remove them wherever they appear so that the
+    # remaining columns keep the original numbering expected by the node
+    # specification.
     columns = list(df.columns)
-    if len(columns) >= 4:
-        third = _normalize_header(columns[2])
-        fourth = _normalize_header(columns[3])
-        if third == "sector" and fourth == "industry":
-            df = df.drop(columns=[columns[2], columns[3]])
-            columns = list(df.columns)
+    drop_candidates = [
+        name for name in columns if _normalize_header(name) in {"sector", "industry"}
+    ]
+    if drop_candidates:
+        df = df.drop(columns=drop_candidates)
+        columns = list(df.columns)
 
     if df.shape[1] < 80:
         raise SnapshotFormatError(f"Soubor '{path.name}' musí obsahovat alespoň 80 sloupců.")
