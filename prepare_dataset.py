@@ -144,6 +144,17 @@ def _normalize_header(value: object) -> str:
     return str(value).strip().lower()
 
 
+def _detect_ticker_column(columns: Sequence[str]) -> Optional[str]:
+    """Return the column whose header indicates it stores ticker symbols."""
+
+    normalized_targets = {"ticker", "ticker symbol", "symbol"}
+    for name in columns:
+        normalized = _normalize_header(name)
+        if normalized in normalized_targets or "ticker" in normalized:
+            return name
+    return None
+
+
 def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
     if pd is None:
         raise SystemExit("pandas is required. Install it via 'pip install pandas openpyxl'.")
@@ -166,7 +177,18 @@ def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
     if df.shape[1] < 80:
         raise SnapshotFormatError(f"Soubor '{path.name}' musí obsahovat alespoň 80 sloupců.")
 
-    ticker_col = df.columns[1]
+    ticker_col = _detect_ticker_column(df.columns)
+    if ticker_col is None:
+        if len(df.columns) < 2:
+            raise SnapshotFormatError(
+                f"Soubor '{path.name}' musí obsahovat sloupec s ticker symboly."
+            )
+        ticker_col = df.columns[1]
+        logging.debug(
+            "%s – nenašel jsem sloupec s názvem 'Ticker', používám druhý sloupec (%s)",
+            path.name,
+            ticker_col,
+        )
     df = df.rename(columns={ticker_col: "Ticker"})
     df["Ticker"] = df["Ticker"].astype(str).str.strip()
     df = df[df["Ticker"] != ""]
