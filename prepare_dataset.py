@@ -172,7 +172,6 @@ def _find_neighbor_index(
     current_idx: int,
     snapshots: Sequence[Snapshot],
     target_days: int,
-    tolerance: int,
     direction: int,
 ) -> Optional[int]:
     current_date = snapshots[current_idx].date
@@ -184,21 +183,16 @@ def _find_neighbor_index(
         iterable = range(current_idx - 1, -1, -1)
         delta_fn = lambda idx: (current_date - snapshots[idx].date).days
 
-    best_idx = None
-    best_delta = None
-
     for idx in iterable:
         delta = delta_fn(idx)
         if delta < 0:
             continue
-        if delta > target_days + tolerance:
+        if delta > target_days:
             break
-        distance = abs(delta - target_days)
-        if distance <= tolerance and (best_idx is None or distance < best_delta):
-            best_idx = idx
-            best_delta = distance
+        if delta == target_days:
+            return idx
 
-    return best_idx
+    return None
 
 
 def _row_value(row: "pd.Series", columns: List[str], column_index: int) -> float:
@@ -301,7 +295,6 @@ def _extract_target(
 def build_dataset(
     data_dir: Path,
     lookback_weeks: int,
-    gap_tolerance: int,
     focus_date: Optional[dt.date] = None,
 ) -> Tuple["pd.DataFrame", "pd.DataFrame", "pd.DataFrame"]:
     snapshot_entries: List[Tuple[dt.date, Path]] = []
@@ -346,7 +339,7 @@ def build_dataset(
         if focus_date and snapshot.date != focus_date:
             continue
 
-        lookback_idx = _find_neighbor_index(idx, snapshots, lookback_days, gap_tolerance, direction=-1)
+        lookback_idx = _find_neighbor_index(idx, snapshots, lookback_days, direction=-1)
         if lookback_idx is None:
             logging.debug("Přeskakuji %s – chybí starší snapshot.", snapshot.path.name)
             continue
@@ -354,7 +347,7 @@ def build_dataset(
         future_indices: Dict[int, int] = {}
         for weeks, column_idx in TARGET_COLUMN_INDEX.items():
             target_idx = _find_neighbor_index(
-                idx, snapshots, weeks * 7, gap_tolerance, direction=1
+                idx, snapshots, weeks * 7, direction=1
             )
             if target_idx is None:
                 break
@@ -472,12 +465,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Počet týdnů mezi aktuálním a starším snapshotem.",
     )
     parser.add_argument(
-        "--gap-tolerance",
-        type=int,
-        default=7,
-        help="Povolená odchylka (ve dnech) při hledání sousedních snapshotů.",
-    )
-    parser.add_argument(
         "--focus-date",
         type=_parse_focus_date,
         help="Volitelně zpracuj pouze snapshot s konkrétním datem (DD.MM.RRRR).",
@@ -503,7 +490,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     features_df, targets_df, metadata_df = build_dataset(
         data_dir=args.data_dir,
         lookback_weeks=args.lookback_weeks,
-        gap_tolerance=args.gap_tolerance,
         focus_date=args.focus_date,
     )
 
