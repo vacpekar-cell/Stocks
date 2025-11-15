@@ -199,6 +199,43 @@ def _find_neighbor_index(
     return None
 
 
+def _neighbor_window(
+    base_date: dt.date,
+    target_days: int,
+    direction: int,
+    tolerance_days: int = WEEKEND_TOLERANCE_DAYS,
+) -> Tuple[dt.date, dt.date]:
+    """Return the acceptable date range for a neighbor snapshot."""
+
+    delta = dt.timedelta(days=target_days)
+    tolerance = dt.timedelta(days=tolerance_days)
+    if direction < 0:
+        center = base_date - delta
+    else:
+        center = base_date + delta
+    return center - tolerance, center + tolerance
+
+
+def _log_missing_neighbor(
+    snapshot: Snapshot,
+    label: str,
+    target_days: int,
+    direction: int,
+    tolerance_days: int = WEEKEND_TOLERANCE_DAYS,
+) -> None:
+    window_start, window_end = _neighbor_window(
+        snapshot.date, target_days, direction, tolerance_days
+    )
+    logging.warning(
+        "%s (%s) – nenalezen %s snapshot v intervalu %s až %s.",
+        snapshot.path.name,
+        snapshot.date.isoformat(),
+        label,
+        window_start.isoformat(),
+        window_end.isoformat(),
+    )
+
+
 def _row_value(row: "pd.Series", columns: List[str], column_index: int) -> float:
     try:
         col_name = columns[column_index - 1]
@@ -339,13 +376,25 @@ def build_dataset(
 
     lookback_days = lookback_weeks * 7
 
+    skip_reason_counts = {
+        "missing_lookback": 0,
+        "missing_future": {weeks: 0 for weeks in TARGET_COLUMN_INDEX},
+        "missing_tickers": 0,
+    }
+    ticker_skip_counts = {
+        "current_nodes": 0,
+        "lookback_nodes": 0,
+        "targets": 0,
+    }
+
     for idx, snapshot in enumerate(snapshots):
         if focus_date and snapshot.date != focus_date:
             continue
 
         lookback_idx = _find_neighbor_index(idx, snapshots, lookback_days, direction=-1)
         if lookback_idx is None:
-            logging.debug("Přeskakuji %s – chybí starší snapshot.", snapshot.path.name)
+            skip_reason_counts["missing_lookback"] += 1
+            _log_missing_neighbor(snapshot, "starší", lookback_days, direction=-1)
             continue
 
         future_indices: Dict[int, int] = {}
@@ -358,7 +407,10 @@ def build_dataset(
             future_indices[weeks] = target_idx
 
         if len(future_indices) != len(TARGET_COLUMN_INDEX):
-            logging.debug("Přeskakuji %s – chybí některý z budoucích snapshotů.", snapshot.path.name)
+            missing_weeks = sorted(set(TARGET_COLUMN_INDEX) - set(future_indices))
+            for weeks in missing_weeks:
+                skip_reason_counts["missing_future"][weeks] += 1
+                _log_missing_neighbor(snapshot, f"budoucí ({weeks}t)", weeks * 7, direction=1)
             continue
 
         lookback_snapshot = snapshots[lookback_idx]
@@ -369,7 +421,8 @@ def build_dataset(
             tickers &= set(future.df.index)
 
         if not tickers:
-            logging.debug("%s – žádné společné tickery.", snapshot.path.name)
+            skip_reason_counts["missing_tickers"] += 1
+            logging.warning("%s (%s) – žádné společné tickery se všemi snapshoty.", snapshot.path.name, snapshot.date.isoformat())
             continue
 
         for ticker in sorted(tickers):
@@ -378,10 +431,12 @@ def build_dataset(
 
             current_nodes = _compute_nodes(current_row, snapshot.columns)
             if current_nodes is None:
+                ticker_skip_counts["current_nodes"] += 1
                 continue
 
             lookback_nodes = _compute_nodes(lookback_row, lookback_snapshot.columns)
             if lookback_nodes is None:
+                ticker_skip_counts["lookback_nodes"] += 1
                 continue
 
             targets: Dict[int, float] = {}
@@ -396,6 +451,7 @@ def build_dataset(
                 targets[weeks] = value
 
             if not target_valid:
+                ticker_skip_counts["targets"] += 1
                 continue
 
             feature_rows.append(current_nodes + lookback_nodes)
@@ -428,6 +484,21 @@ def build_dataset(
         len(features_df),
         len(feature_columns),
         targets_df.shape[1],
+    )
+
+    logging.info(
+        "Diagnostika snapshotů – bez staršího: %s, budoucí 4t: %s, 13t: %s, 26t: %s, bez tickerů: %s.",
+        skip_reason_counts["missing_lookback"],
+        skip_reason_counts["missing_future"][4],
+        skip_reason_counts["missing_future"][13],
+        skip_reason_counts["missing_future"][26],
+        skip_reason_counts["missing_tickers"],
+    )
+    logging.info(
+        "Diagnostika tickerů – aktuální uzly selhaly: %s, starší uzly selhaly: %s, chybějící cíle: %s.",
+        ticker_skip_counts["current_nodes"],
+        ticker_skip_counts["lookback_nodes"],
+        ticker_skip_counts["targets"],
     )
 
     return features_df, targets_df, metadata_df
