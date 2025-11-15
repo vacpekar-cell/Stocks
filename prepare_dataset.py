@@ -56,7 +56,6 @@ except ImportError:  # pragma: no cover - guard for environments without pandas
 
 RELAXED_DATE_PATTERN = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:[ _-].*)?$")
 TICKER_COLUMN_INDEX = 2  # according to the original Finviz export layout
-OPTIONAL_COLUMN_KEYWORDS = ("sector", "industry")
 MAGNITUDE_SUFFIXES = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
 BOOL_MAP = {"yes": 1.0, "no": 0.0}
 TARGET_COLUMN_INDEX = {4: 48, 13: 49, 26: 50}
@@ -70,6 +69,7 @@ class Snapshot:
     path: Path
     df: "pd.DataFrame"
     columns: List[str]
+    column_offset: int
 
 
 class SnapshotFormatError(ValueError):
@@ -148,170 +148,31 @@ def _normalize_header(value: object) -> str:
     return text.strip().lower()
 
 
-@dataclass(frozen=True)
-class ColumnSpec:
-    label: str
-    matchers: Tuple[str, ...]
+def _has_new_format(columns: Sequence[str]) -> bool:
+    """Detect whether the snapshot contains the Sector/Industry columns."""
+
+    if len(columns) < 4:
+        return False
+
+    third = _normalize_header(columns[2])
+    fourth = _normalize_header(columns[3])
+    return third == "sector" and fourth == "industry"
 
 
-def _build_column_specs() -> List[ColumnSpec]:
-    def spec(label: str, *aliases: str) -> ColumnSpec:
-        variations = (label,) + aliases if aliases else (label,)
-        matchers: set[str] = set()
-        for variant in variations:
-            normalized = _normalize_header(variant)
-            matchers.add(normalized)
-            matchers.add(normalized.replace(" ", ""))
-        return ColumnSpec(label=label, matchers=tuple(matchers))
-
-    return [
-        spec("No.", "No"),
-        spec("Ticker", "Ticker Symbol", "Symbol"),
-        spec("Market Cap", "MarketCap"),
-        spec("P/E"),
-        spec("Fwd P/E", "Forward P/E"),
-        spec("PEG"),
-        spec("P/S"),
-        spec("P/B"),
-        spec("P/C"),
-        spec("P/FCF"),
-        spec("Book/sh", "Book/Share"),
-        spec("Cash/sh", "Cash/Share"),
-        spec("Dividend"),
-        spec("Dividend.1", "Dividend %", "Dividend Yield"),
-        spec("Payout Ratio"),
-        spec("EPS"),
-        spec("EPS next Q", "EPS Next Quarter"),
-        spec("EPS This Y", "EPS This Year"),
-        spec("EPS Next Y", "EPS Next Year"),
-        spec("EPS Past 5Y", "EPS Past 5 Years"),
-        spec("EPS Next 5Y", "EPS Next 5 Years"),
-        spec("Sales Past 5Y"),
-        spec("Sales Q/Q"),
-        spec("EPS Q/Q"),
-        spec("Sales"),
-        spec("Income"),
-        spec("Outstanding", "Shares Outstanding"),
-        spec("Float", "Shares Float"),
-        spec("Float %", "Float%", "Float Percent"),
-        spec("Insider Own", "Insider Ownership"),
-        spec("Insider Trans", "Insider Transactions"),
-        spec("Inst Own", "Institutional Ownership"),
-        spec("Inst Trans", "Institutional Transactions"),
-        spec("Short Float", "Short Float %", "Short Interest %"),
-        spec("Short Ratio"),
-        spec("Short Interest"),
-        spec("ROA"),
-        spec("ROE"),
-        spec("ROIC"),
-        spec("Curr R", "Current Ratio"),
-        spec("Quick R", "Quick Ratio"),
-        spec("LTDebt/Eq", "LT Debt/Eq"),
-        spec("Debt/Eq"),
-        spec("Gross M", "Gross Margin"),
-        spec("Oper M", "Operating Margin"),
-        spec("Profit M", "Profit Margin"),
-        spec("Perf Week", "Performance Week"),
-        spec("Perf Month", "Performance Month"),
-        spec("Perf Quart", "Performance Quarter"),
-        spec("Perf Half", "Performance Half"),
-        spec("Perf Year", "Performance Year"),
-        spec("Perf YTD", "Performance YTD"),
-        spec("Beta"),
-        spec("ATR"),
-        spec("Volatility W", "Volatility Week"),
-        spec("Volatility M", "Volatility Month"),
-        spec("SMA20"),
-        spec("SMA50"),
-        spec("SMA200"),
-        spec("50D High"),
-        spec("50D Low"),
-        spec("52W High"),
-        spec("52W Low"),
-        spec("RSI"),
-        spec("Earnings"),
-        spec("Optionable"),
-        spec("Shortable"),
-        spec("Employees"),
-        spec("Change from Open", "Change From Open"),
-        spec("Gap"),
-        spec("Recom", "Recommendation"),
-        spec("Avg Volume", "Average Volume"),
-        spec("Rel Volume", "Relative Volume"),
-        spec("Volume"),
-        spec("Target Price", "Price Target"),
-        spec("Prev Close", "Previous Close"),
-        spec("Open"),
-        spec("High"),
-        spec("Low"),
-        spec("Price"),
-        spec("Change"),
-    ]
-
-
-CANONICAL_COLUMN_SPECS = _build_column_specs()
-
-
-def _align_columns(df: "pd.DataFrame", path: Path) -> Tuple["pd.DataFrame", List[str]]:
-    normalized_info = []
-    for column in df.columns:
-        normalized = _normalize_header(column)
-        normalized_info.append(
-            (column, normalized, normalized.replace(" ", ""))
-        )
-
-    assigned: set[str] = set()
-    ordered_columns: List[str] = []
-    missing: List[str] = []
-
-    for spec in CANONICAL_COLUMN_SPECS:
-        actual_name: Optional[str] = None
-        for column, normalized, compressed in normalized_info:
-            if column in assigned:
-                continue
-            if normalized in spec.matchers or compressed in spec.matchers:
-                actual_name = column
-                assigned.add(column)
-                break
-        if actual_name is None:
-            missing.append(spec.label)
-        else:
-            ordered_columns.append(actual_name)
-
-    if missing:
-        raise SnapshotFormatError(
-            f"Soubor '{path.name}' postrádá očekávané sloupce: {', '.join(missing)}."
-        )
-
-    remaining = [col for col in df.columns if col not in ordered_columns]
-    ordered_columns.extend(remaining)
-    df = df[ordered_columns]
-    return df, ordered_columns
-
-
-def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
+def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str], int]:
     if pd is None:
         raise SystemExit("pandas is required. Install it via 'pip install pandas openpyxl'.")
 
     df = pd.read_excel(path, engine="openpyxl")
     df = df.dropna(how="all")
 
-    # Some newer exports inserted the "Sector" and "Industry" columns (typically
-    # near the ticker column). Remove them wherever they appear so that the
-    # remaining columns keep the original numbering expected by the node
-    # specification.
     columns = list(df.columns)
-    drop_candidates = []
-    for name in columns:
-        normalized = _normalize_header(name)
-        if any(keyword in normalized.replace(" ", "") for keyword in OPTIONAL_COLUMN_KEYWORDS):
-            drop_candidates.append(name)
-    if drop_candidates:
-        df = df.drop(columns=drop_candidates)
-        columns = list(df.columns)
-
-    if df.shape[1] < 80:
-        raise SnapshotFormatError(f"Soubor '{path.name}' musí obsahovat alespoň 80 sloupců.")
+    column_offset = 2 if _has_new_format(columns) else 0
+    required_columns = 80 + column_offset
+    if df.shape[1] < required_columns:
+        raise SnapshotFormatError(
+            f"Soubor '{path.name}' musí obsahovat alespoň {required_columns} sloupců."
+        )
 
     if len(df.columns) < TICKER_COLUMN_INDEX:
         raise SnapshotFormatError(
@@ -329,10 +190,9 @@ def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
     df["Ticker"] = df["Ticker"].astype(str).str.strip()
     df = df[df["Ticker"] != ""]
     df = df.drop_duplicates(subset=["Ticker"], keep="first")
-    df, columns = _align_columns(df, path)
     df = df.set_index("Ticker", drop=False)
     columns = list(df.columns)
-    return df, columns
+    return df, columns, column_offset
 
 
 def _find_neighbor_index(
@@ -407,20 +267,26 @@ def _format_node_failures(counts: Dict[int, int]) -> str:
     return ", ".join(f"node_{idx:02d}: {cnt}" for idx, cnt in items)
 
 
-def _row_value(row: "pd.Series", columns: List[str], column_index: int) -> float:
-    try:
-        col_name = columns[column_index - 1]
-    except IndexError:
+def _row_value(
+    row: "pd.Series", columns: List[str], column_index: int, column_offset: int
+) -> float:
+    adjusted_index = column_index - 1
+    if column_index > 2:
+        adjusted_index += column_offset
+    if adjusted_index < 0 or adjusted_index >= len(columns):
         return math.nan
+    col_name = columns[adjusted_index]
     return _coerce_numeric(row[col_name])
 
 
-def _compute_nodes(row: "pd.Series", columns: List[str]) -> NodeComputation:
+def _compute_nodes(
+    row: "pd.Series", columns: List[str], column_offset: int
+) -> NodeComputation:
     cache: Dict[int, float] = {}
 
     def col(idx: int) -> float:
         if idx not in cache:
-            cache[idx] = _row_value(row, columns, idx)
+            cache[idx] = _row_value(row, columns, idx, column_offset)
         return cache[idx]
 
     def ratio(numerator_idx: int, denominator_idx: int) -> float:
@@ -497,9 +363,9 @@ def _compute_nodes(row: "pd.Series", columns: List[str]) -> NodeComputation:
 
 
 def _extract_target(
-    row: "pd.Series", columns: List[str], column_index: int
+    row: "pd.Series", columns: List[str], column_index: int, column_offset: int
 ) -> Optional[float]:
-    value = _row_value(row, columns, column_index)
+    value = _row_value(row, columns, column_index, column_offset)
     if math.isnan(value) or math.isinf(value):
         return None
     return value
@@ -525,7 +391,7 @@ def build_dataset(
     skipped_snapshots: List[str] = []
     for snap_date, snap_path in snapshot_entries:
         try:
-            df, columns = _load_snapshot(snap_path)
+            df, columns, column_offset = _load_snapshot(snap_path)
         except SnapshotFormatError as exc:
             skipped_snapshots.append(f"{snap_path.name}: {exc}")
             logging.warning("Přeskakuji %s – %s", snap_path.name, exc)
@@ -534,7 +400,15 @@ def build_dataset(
             skipped_snapshots.append(f"{snap_path.name}: {exc}")
             logging.warning("Přeskakuji %s – nepodařilo se načíst (%s)", snap_path.name, exc)
             continue
-        snapshots.append(Snapshot(date=snap_date, path=snap_path, df=df, columns=columns))
+        snapshots.append(
+            Snapshot(
+                date=snap_date,
+                path=snap_path,
+                df=df,
+                columns=columns,
+                column_offset=column_offset,
+            )
+        )
 
     if len(snapshots) < 2:
         reason = "Nepodařilo se načíst dostatek snapshotů."
@@ -639,7 +513,9 @@ def build_dataset(
             current_row = snapshot.df.loc[ticker]
             lookback_row = lookback_snapshot.df.loc[ticker]
 
-            current_nodes = _compute_nodes(current_row, snapshot.columns)
+            current_nodes = _compute_nodes(
+                current_row, snapshot.columns, snapshot.column_offset
+            )
             if current_nodes.values is None:
                 ticker_skip_counts["current_nodes"] += 1
                 snapshot_current_fail += 1
@@ -648,7 +524,9 @@ def build_dataset(
                     snapshot_current_node_failures[current_nodes.failed_node] += 1
                 continue
 
-            lookback_nodes = _compute_nodes(lookback_row, lookback_snapshot.columns)
+            lookback_nodes = _compute_nodes(
+                lookback_row, lookback_snapshot.columns, lookback_snapshot.column_offset
+            )
             if lookback_nodes.values is None:
                 ticker_skip_counts["lookback_nodes"] += 1
                 snapshot_lookback_fail += 1
@@ -662,7 +540,12 @@ def build_dataset(
             for weeks, future_snapshot in future_snapshots.items():
                 column_index = TARGET_COLUMN_INDEX[weeks]
                 future_row = future_snapshot.df.loc[ticker]
-                value = _extract_target(future_row, future_snapshot.columns, column_index)
+                value = _extract_target(
+                    future_row,
+                    future_snapshot.columns,
+                    column_index,
+                    future_snapshot.column_offset,
+                )
                 if value is None:
                     target_valid = False
                     target_failure_counts[weeks] += 1
