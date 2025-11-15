@@ -148,6 +148,147 @@ def _normalize_header(value: object) -> str:
     return text.strip().lower()
 
 
+@dataclass(frozen=True)
+class ColumnSpec:
+    label: str
+    matchers: Tuple[str, ...]
+
+
+def _build_column_specs() -> List[ColumnSpec]:
+    def spec(label: str, *aliases: str) -> ColumnSpec:
+        variations = (label,) + aliases if aliases else (label,)
+        matchers: set[str] = set()
+        for variant in variations:
+            normalized = _normalize_header(variant)
+            matchers.add(normalized)
+            matchers.add(normalized.replace(" ", ""))
+        return ColumnSpec(label=label, matchers=tuple(matchers))
+
+    return [
+        spec("No.", "No"),
+        spec("Ticker", "Ticker Symbol", "Symbol"),
+        spec("Market Cap", "MarketCap"),
+        spec("P/E"),
+        spec("Fwd P/E", "Forward P/E"),
+        spec("PEG"),
+        spec("P/S"),
+        spec("P/B"),
+        spec("P/C"),
+        spec("P/FCF"),
+        spec("Book/sh", "Book/Share"),
+        spec("Cash/sh", "Cash/Share"),
+        spec("Dividend"),
+        spec("Dividend.1", "Dividend %", "Dividend Yield"),
+        spec("Payout Ratio"),
+        spec("EPS"),
+        spec("EPS next Q", "EPS Next Quarter"),
+        spec("EPS This Y", "EPS This Year"),
+        spec("EPS Next Y", "EPS Next Year"),
+        spec("EPS Past 5Y", "EPS Past 5 Years"),
+        spec("EPS Next 5Y", "EPS Next 5 Years"),
+        spec("Sales Past 5Y"),
+        spec("Sales Q/Q"),
+        spec("EPS Q/Q"),
+        spec("Sales"),
+        spec("Income"),
+        spec("Outstanding", "Shares Outstanding"),
+        spec("Float", "Shares Float"),
+        spec("Float %", "Float%", "Float Percent"),
+        spec("Insider Own", "Insider Ownership"),
+        spec("Insider Trans", "Insider Transactions"),
+        spec("Inst Own", "Institutional Ownership"),
+        spec("Inst Trans", "Institutional Transactions"),
+        spec("Short Float", "Short Float %", "Short Interest %"),
+        spec("Short Ratio"),
+        spec("Short Interest"),
+        spec("ROA"),
+        spec("ROE"),
+        spec("ROIC"),
+        spec("Curr R", "Current Ratio"),
+        spec("Quick R", "Quick Ratio"),
+        spec("LTDebt/Eq", "LT Debt/Eq"),
+        spec("Debt/Eq"),
+        spec("Gross M", "Gross Margin"),
+        spec("Oper M", "Operating Margin"),
+        spec("Profit M", "Profit Margin"),
+        spec("Perf Week", "Performance Week"),
+        spec("Perf Month", "Performance Month"),
+        spec("Perf Quart", "Performance Quarter"),
+        spec("Perf Half", "Performance Half"),
+        spec("Perf Year", "Performance Year"),
+        spec("Perf YTD", "Performance YTD"),
+        spec("Beta"),
+        spec("ATR"),
+        spec("Volatility W", "Volatility Week"),
+        spec("Volatility M", "Volatility Month"),
+        spec("SMA20"),
+        spec("SMA50"),
+        spec("SMA200"),
+        spec("50D High"),
+        spec("50D Low"),
+        spec("52W High"),
+        spec("52W Low"),
+        spec("RSI"),
+        spec("Earnings"),
+        spec("Optionable"),
+        spec("Shortable"),
+        spec("Employees"),
+        spec("Change from Open", "Change From Open"),
+        spec("Gap"),
+        spec("Recom", "Recommendation"),
+        spec("Avg Volume", "Average Volume"),
+        spec("Rel Volume", "Relative Volume"),
+        spec("Volume"),
+        spec("Target Price", "Price Target"),
+        spec("Prev Close", "Previous Close"),
+        spec("Open"),
+        spec("High"),
+        spec("Low"),
+        spec("Price"),
+        spec("Change"),
+    ]
+
+
+CANONICAL_COLUMN_SPECS = _build_column_specs()
+
+
+def _align_columns(df: "pd.DataFrame", path: Path) -> Tuple["pd.DataFrame", List[str]]:
+    normalized_info = []
+    for column in df.columns:
+        normalized = _normalize_header(column)
+        normalized_info.append(
+            (column, normalized, normalized.replace(" ", ""))
+        )
+
+    assigned: set[str] = set()
+    ordered_columns: List[str] = []
+    missing: List[str] = []
+
+    for spec in CANONICAL_COLUMN_SPECS:
+        actual_name: Optional[str] = None
+        for column, normalized, compressed in normalized_info:
+            if column in assigned:
+                continue
+            if normalized in spec.matchers or compressed in spec.matchers:
+                actual_name = column
+                assigned.add(column)
+                break
+        if actual_name is None:
+            missing.append(spec.label)
+        else:
+            ordered_columns.append(actual_name)
+
+    if missing:
+        raise SnapshotFormatError(
+            f"Soubor '{path.name}' postrádá očekávané sloupce: {', '.join(missing)}."
+        )
+
+    remaining = [col for col in df.columns if col not in ordered_columns]
+    ordered_columns.extend(remaining)
+    df = df[ordered_columns]
+    return df, ordered_columns
+
+
 def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
     if pd is None:
         raise SystemExit("pandas is required. Install it via 'pip install pandas openpyxl'.")
@@ -188,8 +329,8 @@ def _load_snapshot(path: Path) -> Tuple["pd.DataFrame", List[str]]:
     df["Ticker"] = df["Ticker"].astype(str).str.strip()
     df = df[df["Ticker"] != ""]
     df = df.drop_duplicates(subset=["Ticker"], keep="first")
+    df, columns = _align_columns(df, path)
     df = df.set_index("Ticker", drop=False)
-
     columns = list(df.columns)
     return df, columns
 
