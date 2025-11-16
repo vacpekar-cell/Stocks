@@ -19,7 +19,8 @@ For every snapshot that has the necessary neighbours the script:
 * locates the files that are 4, 13 and 26 weeks newer (targets),
 * matches rows by ticker symbol (column 2),
 * computes the 33 nodes for both current and look-back rows, and
-* reads target values from columns 48, 49 and 50 of the future snapshots.
+* reads target values from columns 48, 49 and 50 of the future snapshots, then
+  normalizes them as ``(1 - tanh(sign(x) * abs(x) ** 0.75)) / 2``.
 
 Outputs (saved under ``--output-dir``):
 
@@ -349,6 +350,19 @@ def _extract_target(
     return value
 
 
+def _normalize_target(value: float) -> float:
+    """Apply the requested target normalization."""
+
+    sign = 0.0
+    if value > 0:
+        sign = 1.0
+    elif value < 0:
+        sign = -1.0
+
+    transformed = sign * (abs(value) ** 0.75)
+    return (1.0 - math.tanh(transformed)) / 2.0
+
+
 def build_dataset(
     data_dir: Path,
     lookback_weeks: int,
@@ -536,7 +550,13 @@ def build_dataset(
                 continue
 
             feature_rows.append(current_nodes.values + lookback_nodes.values)
-            target_rows.append([targets[4], targets[13], targets[26]])
+            target_rows.append(
+                [
+                    _normalize_target(targets[4]),
+                    _normalize_target(targets[13]),
+                    _normalize_target(targets[26]),
+                ]
+            )
             metadata_rows.append(
                 {
                     "Ticker": ticker,
