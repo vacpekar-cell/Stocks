@@ -599,12 +599,35 @@ class TrainingThread(threading.Thread):
             
             if self.stop_event.is_set():
                 return float('inf')
-            
+
             logger.finish()
-            
+
             model_file = f"model_resnet_{network_id}_{timestamp}.pt"
+            uncertainty_file = f"uncertainty_{os.path.splitext(model_file)[0]}.npy"
+
+            # Kalibrace šumu na základě validačních reziduí
+            model.load_state_dict(best_model_state)
+            model.to(device)
+            model.eval()
+
+            residuals = []
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs = inputs.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
+                    outputs = model(inputs)
+                    residuals.append((outputs - targets).cpu())
+
+            if residuals:
+                residuals_cat = torch.cat(residuals)
+                residual_std = residuals_cat.std(dim=0).numpy()
+                np.save(uncertainty_file, residual_std)
+                self.app.thread_safe_logger.log(
+                    f"Odhad nejistoty uložen jako '{uncertainty_file}'"
+                )
+
             torch.save(best_model_state, model_file)
-            
+
             self.app.thread_safe_logger.log(f"Síť {network_id} dokončena. Nejlepší validační ztráta: {best_val_loss:.6f}")
             self.app.thread_safe_logger.log(f"Model uložen jako '{model_file}'")
             
@@ -709,8 +732,8 @@ class NeuralNetApp:
         self.batch_size.grid(row=0, column=3, padx=5)
         
         ttk.Label(param_frame, text="Počet sítí:").grid(row=0, column=4, sticky=tk.W, pady=5, padx=(15,0))
-        self.num_networks = ttk.Entry(param_frame, width=8)
-        self.num_networks.insert(0, "10")
+        self.num_networks = ttk.Entry(param_frame, width=8, state='disabled')
+        self.num_networks.insert(0, "1")
         self.num_networks.grid(row=0, column=5, padx=5)
         
         ttk.Label(param_frame, text="Learning rate:").grid(row=1, column=0, sticky=tk.W, pady=5)
@@ -817,13 +840,18 @@ class NeuralNetApp:
         ttk.Checkbutton(pred_settings, text="Použít GPU", 
                       variable=self.use_gpu).grid(row=0, column=0, sticky=tk.W, pady=5)
         
-        ttk.Checkbutton(pred_settings, text="Mixed precision", 
+        ttk.Checkbutton(pred_settings, text="Mixed precision",
                       variable=self.use_mixed_precision).grid(row=0, column=1, sticky=tk.W, pady=5)
-        
+
         ttk.Label(pred_settings, text="Predikční batch size:").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.pred_batch_size = ttk.Entry(pred_settings, width=8)
         self.pred_batch_size.insert(0, "256")
         self.pred_batch_size.grid(row=1, column=1, padx=5, sticky=tk.W)
+
+        ttk.Label(pred_settings, text="Počet simulací (vzorků):").grid(row=1, column=2, sticky=tk.W, pady=5)
+        self.pred_samples = ttk.Entry(pred_settings, width=8)
+        self.pred_samples.insert(0, "10")
+        self.pred_samples.grid(row=1, column=3, padx=5, sticky=tk.W)
         
         ttk.Label(pred_settings, text="Konkrétní model (pokud nepoužíváte načtené modely):").grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=5)
         self.model_file = ttk.Entry(pred_settings, width=50)
@@ -1029,7 +1057,7 @@ class NeuralNetApp:
                 seed = int(self.random_seed.get())
                 epochs = int(self.epochs.get())
                 batch_size = int(self.batch_size.get())
-                num_networks = int(self.num_networks.get())
+                num_networks = 1
                 dropout_rate = float(self.dropout_rate.get())
                 use_augmentation = self.use_augmentation.get()
                 noise_level = float(self.noise_level.get())
@@ -1128,13 +1156,18 @@ class NeuralNetApp:
             
             if self.loaded_models:
                 models_to_use = self.loaded_models
-                self.output_text.insert(tk.END, f"Používám načtené modely: {len(models_to_use)} sítí\n")
+                if len(models_to_use) > 1:
+                    self.output_text.insert(tk.END, "Načteno více modelů, pro simulace bude použit první.\n")
+                else:
+                    self.output_text.insert(tk.END, "Používám načtený model.\n")
             elif specific_model_path and os.path.exists(specific_model_path):
                 models_to_use = [specific_model_path]
                 self.output_text.insert(tk.END, f"Používám konkrétní model: {specific_model_path}\n")
             else:
                 messagebox.showerror("Chyba", "Nejsou načteny žádné modely ani vybrán konkrétní model!")
                 return
+
+            model_file = models_to_use[0]
             
             scaler_files = [f for f in os.listdir('.') if f.startswith('scaler_') and f.endswith('.pkl')]
             if scaler_files:
@@ -1181,65 +1214,81 @@ class NeuralNetApp:
                 
                 batch_size = int(self.pred_batch_size.get())
                 
-                all_predictions = []
-                
                 self.output_text.insert(tk.END, "Provádění predikcí...\n")
-                
-                for i, model_file in enumerate(models_to_use, start=1):
-                    try:
-                        gc.collect()
-                        if device.type == 'cuda':
-                            torch.cuda.empty_cache()
-                            torch.cuda.synchronize()
-                        
-                        model = EfficientResNet(
-                            X_predict_scaled.shape[1], 
-                            hidden_dims=[512, 256, 128, 64],
-                            use_sigmoid=self.use_sigmoid.get()
-                        )
-                        
-                        model.load_state_dict(torch.load(model_file, map_location=device))
-                        model.to(device)
-                        model.eval()
-                        
-                        predictions = []
-                        num_samples = X_predict_tensor.shape[0]
-                        
-                        with torch.no_grad():
-                            for start in range(0, num_samples, batch_size):
-                                end = min(start + batch_size, num_samples)
-                                batch_data = X_predict_tensor[start:end].to(device, non_blocking=True)
-                                
-                                if use_mixed_precision:
-                                    with torch.cuda.amp.autocast():
-                                        batch_predictions = model(batch_data).cpu().numpy()
-                                else:
-                                    batch_predictions = model(batch_data).cpu().numpy()
-                                
-                                predictions.append(batch_predictions)
-                        
-                        model_predictions = np.vstack(predictions)
-                        all_predictions.append(model_predictions)
-                        
-                        self.output_text.insert(tk.END, f"Predikce modelem {i} dokončena.\n")
-                        
-                    except Exception as e:
-                        self.output_text.insert(tk.END, f"Chyba při predikci modelem {model_file}: {str(e)}\n")
-                
-                if not all_predictions:
-                    messagebox.showerror("Chyba", "Žádný model neprovedl úspěšnou predikci.")
-                    return
-                
+
+                gc.collect()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                model = EfficientResNet(
+                    X_predict_scaled.shape[1],
+                    hidden_dims=[512, 256, 128, 64],
+                    use_sigmoid=self.use_sigmoid.get()
+                )
+
+                model.load_state_dict(torch.load(model_file, map_location=device))
+                model.to(device)
+                model.eval()
+
+                predictions = []
+                num_rows = X_predict_tensor.shape[0]
+
+                with torch.no_grad():
+                    for start in range(0, num_rows, batch_size):
+                        end = min(start + batch_size, num_rows)
+                        batch_data = X_predict_tensor[start:end].to(device, non_blocking=True)
+
+                        if use_mixed_precision:
+                            with torch.cuda.amp.autocast():
+                                batch_predictions = model(batch_data).cpu().numpy()
+                        else:
+                            batch_predictions = model(batch_data).cpu().numpy()
+
+                        predictions.append(batch_predictions)
+
+                base_predictions = np.vstack(predictions)
+
+                # Načtení kalibrovaného šumu a generování více vzorků
+                try:
+                    num_prediction_samples = max(1, int(self.pred_samples.get()))
+                except Exception:
+                    num_prediction_samples = 10
+
+                uncertainty_file = f"uncertainty_{os.path.splitext(os.path.basename(model_file))[0]}.npy"
+                if os.path.exists(uncertainty_file):
+                    noise_std = np.load(uncertainty_file)
+                    self.output_text.insert(tk.END, f"Načten kalibrovaný šum z {uncertainty_file}.\n")
+                else:
+                    noise_std = np.zeros(base_predictions.shape[1])
+                    self.output_text.insert(tk.END, "Kalibrovaný šum nenalezen, bude použit nulový.\n")
+
+                rng = np.random.default_rng()
+                samples = []
+                noise_std = noise_std.reshape(1, base_predictions.shape[1])
+                for _ in range(num_prediction_samples):
+                    noise = rng.normal(loc=0.0, scale=noise_std, size=base_predictions.shape)
+                    samples.append(base_predictions + noise)
+
+                sample_array = np.stack(samples)
+                mean_preds = sample_array.mean(axis=0)
+                std_preds = sample_array.std(axis=0)
+
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                
+
                 results = {}
                 horizons = ["26w", "13w", "4w"]
-                
-                for i, preds in enumerate(all_predictions, start=1):
+
+                for sample_idx in range(num_prediction_samples):
                     for j, horizon in enumerate(horizons):
-                        col_name = f"model_{i}_{horizon}"
-                        results[col_name] = preds[:, j]
-                
+                        col_name = f"sample_{sample_idx + 1}_{horizon}"
+                        results[col_name] = sample_array[sample_idx, :, j]
+
+                for j, horizon in enumerate(horizons):
+                    results[f"base_{horizon}"] = base_predictions[:, j]
+                    results[f"mean_{horizon}"] = mean_preds[:, j]
+                    results[f"std_{horizon}"] = std_preds[:, j]
+
                 output_file = f"predictions_{timestamp}.csv"
                 output_df = pd.DataFrame(results)
                 output_df.to_csv(output_file, index=False)
