@@ -1277,7 +1277,9 @@ class NeuralNetApp:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
 
                 results = {}
-                horizons = ["26w", "13w", "4w"]
+                # Targets in the dataset are ordered as 4w, 13w, 26w, so keep the
+                # exported prediction headers in the same order.
+                horizons = ["4w", "13w", "26w"]
 
                 for sample_idx in range(num_prediction_samples):
                     for j, horizon in enumerate(horizons):
