@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Assemble a prediction-ready feature matrix from the newest snapshot pair.
 
-This utility mirrors the node calculations used in ``prepare_dataset.py`` but
-only processes the most recent snapshot and its look-back neighbour that is
-exactly four weeks older (with the same weekend tolerance). The resulting CSV
-matches the 66-input layout expected by ``neural_network_training_with_ui.py``
-for inference, and an auxiliary Excel file is emitted that retains only the
-rows used for the prediction run.
+This utility directly reuses ``prepare_dataset._compute_nodes`` so that any
+adjustment to the node definitions automatically carries over to the prediction
+path. It processes only the most recent snapshot and its look-back neighbour
+that is exactly four weeks older (with the same weekend tolerance). The
+resulting CSV matches the 66-input layout expected by
+``neural_network_training_with_ui.py`` for inference, and an auxiliary Excel
+file is emitted that retains only the rows used for the prediction run.
 """
 from __future__ import annotations
 
