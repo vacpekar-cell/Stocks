@@ -1229,46 +1229,49 @@ class NeuralNetApp:
 
                 model.load_state_dict(torch.load(model_file, map_location=device))
                 model.to(device)
-                model.eval()
 
-                predictions = []
+                def run_single_pass(active_model):
+                    pass_predictions = []
+                    with torch.no_grad():
+                        for start in range(0, num_rows, batch_size):
+                            end = min(start + batch_size, num_rows)
+                            batch_data = X_predict_tensor[start:end].to(device, non_blocking=True)
+
+                            if use_mixed_precision:
+                                with torch.cuda.amp.autocast():
+                                    batch_predictions = active_model(batch_data).cpu().numpy()
+                            else:
+                                batch_predictions = active_model(batch_data).cpu().numpy()
+
+                            pass_predictions.append(batch_predictions)
+
+                    return np.vstack(pass_predictions)
+
                 num_rows = X_predict_tensor.shape[0]
 
-                with torch.no_grad():
-                    for start in range(0, num_rows, batch_size):
-                        end = min(start + batch_size, num_rows)
-                        batch_data = X_predict_tensor[start:end].to(device, non_blocking=True)
+                model.eval()
+                base_predictions = run_single_pass(model)
 
-                        if use_mixed_precision:
-                            with torch.cuda.amp.autocast():
-                                batch_predictions = model(batch_data).cpu().numpy()
-                        else:
-                            batch_predictions = model(batch_data).cpu().numpy()
-
-                        predictions.append(batch_predictions)
-
-                base_predictions = np.vstack(predictions)
-
-                # Načtení kalibrovaného šumu a generování více vzorků
                 try:
                     num_prediction_samples = max(1, int(self.pred_samples.get()))
                 except Exception:
                     num_prediction_samples = 10
 
-                uncertainty_file = f"uncertainty_{os.path.splitext(os.path.basename(model_file))[0]}.npy"
-                if os.path.exists(uncertainty_file):
-                    noise_std = np.load(uncertainty_file)
-                    self.output_text.insert(tk.END, f"Načten kalibrovaný šum z {uncertainty_file}.\n")
-                else:
-                    noise_std = np.zeros(base_predictions.shape[1])
-                    self.output_text.insert(tk.END, "Kalibrovaný šum nenalezen, bude použit nulový.\n")
+                # Monte Carlo dropout: povolíme dropout při inference a necháme
+                # BatchNorm ve stabilním režimu eval.
+                model.train()
+                for module in model.modules():
+                    if isinstance(module, nn.BatchNorm1d):
+                        module.eval()
 
-                rng = np.random.default_rng()
+                self.output_text.insert(
+                    tk.END,
+                    f"Monte Carlo dropout aktivní, generuji {num_prediction_samples} vzorků.\n"
+                )
+
                 samples = []
-                noise_std = noise_std.reshape(1, base_predictions.shape[1])
                 for _ in range(num_prediction_samples):
-                    noise = rng.normal(loc=0.0, scale=noise_std, size=base_predictions.shape)
-                    samples.append(base_predictions + noise)
+                    samples.append(run_single_pass(model))
 
                 sample_array = np.stack(samples)
                 mean_preds = sample_array.mean(axis=0)
