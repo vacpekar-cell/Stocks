@@ -24,7 +24,7 @@ This repository currently uses a fixed Gaussian residual noise vector saved to `
    - Undo the target normalization before aggregating so outputs are in the original return scale.
    - Mean prediction: `mean_preds = samples.mean(dim=0)`
    - Predictive std: `std_preds = samples.std(dim=0, unbiased=False)`
-5. **Use stats downstream:** Feed `mean_preds` into your gamma-mode ranking (mean - var/mean). Use `std_preds` as the uncertainty term instead of the static `uncertainty_<model>.npy` values.
+5. **Use stats downstream:** If you rank with a gamma-mode, shift the predicted returns into a non-negative multiplier by adding `1` before computing `mode = (mean+1) - var/(mean+1)`. Use `std_preds` as the uncertainty term instead of the static `uncertainty_<model>.npy` values.
 
 ## Tips to keep results stable
 - Keep dropout rates as trained; do **not** retrain in train mode during sampling.

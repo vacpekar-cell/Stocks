@@ -1291,9 +1291,14 @@ class NeuralNetApp:
                 for j, horizon in enumerate(horizons):
                     results[f"mean_{horizon}"] = mean_preds[:, j]
                     results[f"std_{horizon}"] = std_preds[:, j]
+                    gamma_mean = mean_preds[:, j] + 1.0
                     gamma_mode = np.where(
-                        mean_preds[:, j] > 1e-8,
-                        mean_preds[:, j] - (std_preds[:, j] ** 2) / mean_preds[:, j],
+                        gamma_mean > 1e-8,
+                        np.clip(
+                            gamma_mean - (std_preds[:, j] ** 2) / gamma_mean,
+                            a_min=0.0,
+                            a_max=None,
+                        ),
                         np.nan,
                     )
                     results[f"gamma_mode_{horizon}"] = gamma_mode
