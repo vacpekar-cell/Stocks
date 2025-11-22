@@ -20,6 +20,20 @@ python fetch_fmp_fundamentals.py \
 ```
 Výstupní soubory budou pojmenovány jako `TSLA_epsdiluted_ttm.csv` a obsahují sloupce `date,epsdiluted_ttm`.
 
+## Interaktivní UI (bez psaní parametrů)
+Pokud se nechcete zabývat parametry, spusťte jednoduché textové UI, které si vše vyžádá:
+
+```bash
+python fmp_fundamentals_ui.py
+```
+
+Průběh:
+- skript se zeptá na tickery, metriky, počet stažených výkazů, periodu a volbu TTM; Enter potvrdí výchozí hodnoty
+- API klíč vezme z `FMP_API_KEY`, nebo vás vyzve k zadání
+- výsledné CSV ukládá stejně jako `fetch_fmp_fundamentals.py` do adresáře `data/fmp` (nebo cesty, kterou zadáte)
+
+UI používá stejné helpery jako původní skript, takže chování a formát výstupů jsou identické.
+
 ## Tipy a poznámky
 - `--metrics` může obsahovat více polí oddělených čárkou (např. `epsdiluted,ebit`). Dostupná pole
   najdete v dokumentaci FMP k endpointu Income Statement.
