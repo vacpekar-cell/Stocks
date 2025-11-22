@@ -19,8 +19,9 @@ This repository currently uses a fixed Gaussian residual noise vector saved to `
 ## How to implement (step by step)
 1. **Switch model to train mode for sampling:** After loading the trained model but before prediction, call `model.train()` instead of `model.eval()`. This keeps dropout active while leaving BatchNorm statistics fixed if you avoid further training steps.
 2. **Disable gradient tracking:** Wrap the sampling loop in `with torch.no_grad():` to avoid autograd overhead.
-3. **Draw multiple samples:** For each input batch, run `K` stochastic forward passes (e.g., `K=30`). Stack the outputs to shape `(K, batch, horizons)`.
+3. **Draw multiple samples:** For each input batch, run `K` stochastic forward passes (e.g., `K=50`). Stack the outputs to shape `(K, batch, horizons)`.
 4. **Aggregate statistics:**
+   - Undo the target normalization before aggregating so outputs are in the original return scale.
    - Mean prediction: `mean_preds = samples.mean(dim=0)`
    - Predictive std: `std_preds = samples.std(dim=0, unbiased=False)`
 5. **Use stats downstream:** Feed `mean_preds` into your gamma-mode ranking (mean - var/mean). Use `std_preds` as the uncertainty term instead of the static `uncertainty_<model>.npy` values.
@@ -28,7 +29,7 @@ This repository currently uses a fixed Gaussian residual noise vector saved to `
 ## Tips to keep results stable
 - Keep dropout rates as trained; do **not** retrain in train mode during sampling.
 - Fix a random seed (`torch.manual_seed`) to make experiments reproducible.
-- Start with `K=30` samples; increase if the std looks noisy.
+- Start with `K=50` samples; increase if the std looks noisy.
 - If BatchNorm instability appears, replace BatchNorm with LayerNorm in future training runs, or cache running stats before sampling.
 
 ## Expected outcome

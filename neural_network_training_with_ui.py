@@ -850,7 +850,7 @@ class NeuralNetApp:
 
         ttk.Label(pred_settings, text="Počet simulací (vzorků):").grid(row=1, column=2, sticky=tk.W, pady=5)
         self.pred_samples = ttk.Entry(pred_settings, width=8)
-        self.pred_samples.insert(0, "10")
+        self.pred_samples.insert(0, "50")
         self.pred_samples.grid(row=1, column=3, padx=5, sticky=tk.W)
         
         ttk.Label(pred_settings, text="Konkrétní model (pokud nepoužíváte načtené modely):").grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=5)
@@ -1229,6 +1229,7 @@ class NeuralNetApp:
 
                 model.load_state_dict(torch.load(model_file, map_location=device))
                 model.to(device)
+                model.eval()
 
                 def run_single_pass(active_model):
                     pass_predictions = []
@@ -1249,13 +1250,15 @@ class NeuralNetApp:
 
                 num_rows = X_predict_tensor.shape[0]
 
-                model.eval()
-                base_predictions = run_single_pass(model)
+                def inverse_target_transform(values: np.ndarray) -> np.ndarray:
+                    clipped = np.clip(values, 1e-6, 1 - 1e-6)
+                    z = np.arctanh(1 - 2 * clipped)
+                    return np.sign(z) * (np.abs(z) ** (4.0 / 3.0))
 
                 try:
                     num_prediction_samples = max(1, int(self.pred_samples.get()))
                 except Exception:
-                    num_prediction_samples = 10
+                    num_prediction_samples = 50
 
                 # Monte Carlo dropout: povolíme dropout při inference a necháme
                 # BatchNorm ve stabilním režimu eval.
@@ -1274,8 +1277,9 @@ class NeuralNetApp:
                     samples.append(run_single_pass(model))
 
                 sample_array = np.stack(samples)
-                mean_preds = sample_array.mean(axis=0)
-                std_preds = sample_array.std(axis=0)
+                sample_array_raw = inverse_target_transform(sample_array)
+                mean_preds = sample_array_raw.mean(axis=0)
+                std_preds = sample_array_raw.std(axis=0)
 
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
 
@@ -1284,15 +1288,15 @@ class NeuralNetApp:
                 # exported prediction headers in the same order.
                 horizons = ["4w", "13w", "26w"]
 
-                for sample_idx in range(num_prediction_samples):
-                    for j, horizon in enumerate(horizons):
-                        col_name = f"sample_{sample_idx + 1}_{horizon}"
-                        results[col_name] = sample_array[sample_idx, :, j]
-
                 for j, horizon in enumerate(horizons):
-                    results[f"base_{horizon}"] = base_predictions[:, j]
                     results[f"mean_{horizon}"] = mean_preds[:, j]
                     results[f"std_{horizon}"] = std_preds[:, j]
+                    gamma_mode = np.where(
+                        mean_preds[:, j] > 1e-8,
+                        mean_preds[:, j] - (std_preds[:, j] ** 2) / mean_preds[:, j],
+                        np.nan,
+                    )
+                    results[f"gamma_mode_{horizon}"] = gamma_mode
 
                 output_file = f"predictions_{timestamp}.csv"
                 output_df = pd.DataFrame(results)
