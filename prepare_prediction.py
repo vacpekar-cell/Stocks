@@ -12,6 +12,7 @@ file is emitted that retains only the rows used for the prediction run.
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -22,6 +23,40 @@ except ImportError:  # pragma: no cover - optional dependency guard
     pd = None  # type: ignore[assignment]
 
 import prepare_dataset as prep
+
+
+def _require_snapshot_date_support():
+    """Ensure ``prepare_dataset._compute_nodes`` accepts the snapshot date argument."""
+
+    signature = inspect.signature(prep._compute_nodes)
+    positional_params = [
+        param
+        for param in signature.parameters.values()
+        if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(positional_params) < 4:
+        raise RuntimeError(
+            "prepare_dataset._compute_nodes musí přijímat argument snapshot_date (4. parametr) kvůli"
+            " výpočtu sloupce 65. Ujistěte se, že používáte aktuální verzi prepare_dataset.py."
+        )
+
+
+def _compute_nodes_for_snapshot(row: "pd.Series", snapshot: prep.Snapshot) -> prep.NodeComputation:
+    try:
+        nodes = prep._compute_nodes(row, snapshot.columns, snapshot.column_offset, snapshot.date)
+    except TypeError as exc:  # pragma: no cover - defensive clarity for mismatched installs
+        raise RuntimeError(
+            "Volání prepare_dataset._compute_nodes selhalo kvůli nesouladu parametrů."
+            " Aktualizujte prosím soubory na poslední verzi."
+        ) from exc
+
+    expected_count = getattr(prep, "NODE_COUNT", 54)
+    if nodes.values is not None and len(nodes.values) != expected_count:
+        raise RuntimeError(
+            f"prepare_dataset._compute_nodes vrátilo {len(nodes.values)} hodnot, očekává se {expected_count}."
+        )
+
+    return nodes
 
 
 def _collect_dated_paths(data_dir: Path) -> List[Tuple[pd.Timestamp, Path]]:
@@ -112,6 +147,8 @@ def _current_and_lookback(snapshots: Sequence[prep.Snapshot]) -> Tuple[prep.Snap
 
 
 def _compute_feature_rows(current: prep.Snapshot, lookback: prep.Snapshot):
+    _require_snapshot_date_support()
+
     common = current.df.index.intersection(lookback.df.index)
     rows: List[List[float]] = []
     used_tickers: List[str] = []
@@ -120,14 +157,10 @@ def _compute_feature_rows(current: prep.Snapshot, lookback: prep.Snapshot):
         cur_row = current.df.loc[ticker]
         lb_row = lookback.df.loc[ticker]
 
-        cur_nodes = prep._compute_nodes(
-            cur_row, current.columns, current.column_offset, current.date
-        )  # type: ignore[attr-defined]
+        cur_nodes = _compute_nodes_for_snapshot(cur_row, current)
         if cur_nodes.values is None:
             continue
-        lb_nodes = prep._compute_nodes(
-            lb_row, lookback.columns, lookback.column_offset, lookback.date
-        )  # type: ignore[attr-defined]
+        lb_nodes = _compute_nodes_for_snapshot(lb_row, lookback)
         if lb_nodes.values is None:
             continue
 
