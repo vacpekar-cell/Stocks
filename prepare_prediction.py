@@ -5,7 +5,7 @@ This utility directly reuses ``prepare_dataset._compute_nodes`` so that any
 adjustment to the node definitions automatically carries over to the prediction
 path. It processes only the most recent snapshot and its look-back neighbour
 that is exactly four weeks older (with the same weekend tolerance). The
-resulting CSV matches the 66-input layout expected by
+resulting CSV matches the 108-input layout expected by
 ``neural_network_training_with_ui.py`` for inference, and an auxiliary Excel
 file is emitted that retains only the rows used for the prediction run.
 """
@@ -120,10 +120,14 @@ def _compute_feature_rows(current: prep.Snapshot, lookback: prep.Snapshot):
         cur_row = current.df.loc[ticker]
         lb_row = lookback.df.loc[ticker]
 
-        cur_nodes = prep._compute_nodes(cur_row, current.columns, current.column_offset)  # type: ignore[attr-defined]
+        cur_nodes = prep._compute_nodes(
+            cur_row, current.columns, current.column_offset, current.date
+        )  # type: ignore[attr-defined]
         if cur_nodes.values is None:
             continue
-        lb_nodes = prep._compute_nodes(lb_row, lookback.columns, lookback.column_offset)  # type: ignore[attr-defined]
+        lb_nodes = prep._compute_nodes(
+            lb_row, lookback.columns, lookback.column_offset, lookback.date
+        )  # type: ignore[attr-defined]
         if lb_nodes.values is None:
             continue
 

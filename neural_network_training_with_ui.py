@@ -138,6 +138,14 @@ class EfficientResNet(nn.Module):
             
         return x
 
+
+def scaled_hidden_dims(input_dim: int) -> list[int]:
+    base_input = 66
+    base_dims = [512, 256, 128, 64]
+    ratio = input_dim / base_input
+    scaled = [max(32, int(round(dim * ratio))) for dim in base_dims]
+    return scaled
+
 # Thread-safe logger
 class ThreadSafeLogger:
     def __init__(self, callback, update_interval=100):
@@ -456,9 +464,9 @@ class TrainingThread(threading.Thread):
             )
             
             model = EfficientResNet(
-                X_train.shape[1], 
-                hidden_dims=[512, 256, 128, 64],
-                dropout_rate=dropout_rate, 
+                X_train.shape[1],
+                hidden_dims=scaled_hidden_dims(X_train.shape[1]),
+                dropout_rate=dropout_rate,
                 use_sigmoid=use_sigmoid
             )
             
@@ -1177,15 +1185,17 @@ class NeuralNetApp:
                 messagebox.showerror("Chyba", "Nenalezen žádný scaler. Spusťte nejprve trénování!")
                 return
             
-            with open(scaler_file, "rb") as f:
-                scaler = pickle.load(f)
+                with open(scaler_file, "rb") as f:
+                    scaler = pickle.load(f)
             
             try:
                 self.output_text.insert(tk.END, "Načítání dat pro predikci...\n")
-                
+
                 X_predict = pd.read_csv(predict_path, header=None)
-                
-                expected_cols = 66  # Toto by mělo být nastaveno podle počtu sloupců v trénovacích datech
+
+                expected_cols = getattr(scaler, "n_features_in_", None) or (
+                    len(self.training_columns) if self.training_columns else 108
+                )
                 if X_predict.shape[1] != expected_cols:
                     messagebox.showerror("Chyba", f"Vstupní data pro predikci musí mít {expected_cols} sloupců (má {X_predict.shape[1]})!")
                     return
@@ -1223,7 +1233,7 @@ class NeuralNetApp:
 
                 model = EfficientResNet(
                     X_predict_scaled.shape[1],
-                    hidden_dims=[512, 256, 128, 64],
+                    hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1]),
                     use_sigmoid=self.use_sigmoid.get()
                 )
 

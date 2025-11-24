@@ -4,8 +4,8 @@
 The snapshots stored in this repository contain one row per ticker and dozens of
 columns copied from Finviz. Each file is named ``DD.MM.YYYY.xlsx`` and
 represents the situation at the close of a Friday session. The training setup
-requires 66 inputs (33 derived values from the "current" snapshot + the same 33
-values from the snapshot that is four weeks older) and three targets describing
+requires 108 inputs (54 derived values from the "current" snapshot + the same
+54 values from the snapshot that is four weeks older) and three targets describing
 how the ticker performed 4, 13 and 26 weeks into the future.
 
 The mapping between Excel columns (1-based) and neural network nodes is defined
@@ -18,7 +18,7 @@ For every snapshot that has the necessary neighbours the script:
 * locates the file that is four weeks older (look-back),
 * locates the files that are 4, 13 and 26 weeks newer (targets),
 * matches rows by ticker symbol (column 2),
-* computes the 33 nodes for both current and look-back rows, and
+* computes the 54 nodes for both current and look-back rows, and
 * reads target values from columns 48, 49 and 50 of the future snapshots, then
   normalizes them as ``(1 - tanh(sign(x) * abs(x) ** 0.75)) / 2``.
 
@@ -61,8 +61,13 @@ MAGNITUDE_SUFFIXES = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
 BOOL_MAP = {"yes": 1.0, "no": 0.0}
 TARGET_COLUMN_INDEX = {4: 48, 13: 49, 26: 50}
 WEEKEND_TOLERANCE_DAYS = 2  # allow Saturday/Sunday captures to pair with Friday baselines
-NODE_COUNT = 33
+NODE_COUNT = 54
+BASE_INPUT_DIM = 66  # historical input dimensionality used for proportional scaling
 NEW_FORMAT_START = dt.date(2024, 8, 16)
+EARNINGS_MONTHS = {name: idx for idx, name in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+    start=1,
+)}
 
 
 @dataclass
@@ -258,8 +263,22 @@ def _row_value(
     return _coerce_numeric(row[col_name])
 
 
+def _raw_cell(
+    row: "pd.Series", columns: List[str], column_index: int, column_offset: int
+):
+    """Return the unprocessed cell value respecting the new-format offset."""
+
+    adjusted_index = column_index - 1
+    if column_index > 2:
+        adjusted_index += column_offset
+    if adjusted_index < 0 or adjusted_index >= len(columns):
+        return None
+    col_name = columns[adjusted_index]
+    return row[col_name]
+
+
 def _compute_nodes(
-    row: "pd.Series", columns: List[str], column_offset: int
+    row: "pd.Series", columns: List[str], column_offset: int, snapshot_date: dt.date
 ) -> NodeComputation:
     cache: Dict[int, float] = {}
 
@@ -298,6 +317,49 @@ def _compute_nodes(
             return 0.0
         return value
 
+    def earnings_gap_days(idx: int) -> float:
+        value = _raw_cell(row, columns, idx, column_offset)
+        if value is None:
+            return math.nan
+
+        text = str(value).strip()
+        if not text or text == "-":
+            return math.nan
+
+        text = text.replace("\xa0", " ")
+        match = re.fullmatch(
+            r"(?i)\s*([A-Za-z]{3})\s+(\d{1,2})(?:\s*(?:/)?([ab]))?(?:\s+(\d{2,4}))?\s*",
+            text,
+        )
+        if not match:
+            return math.nan
+
+        month_abbr, day_str, _session, year_str = match.groups()
+        month = EARNINGS_MONTHS.get(month_abbr.capitalize())
+        if month is None:
+            return math.nan
+
+        day = int(day_str)
+        if year_str:
+            year = int(year_str)
+            if year < 100:
+                year += 2000
+        else:
+            year = snapshot_date.year
+            candidate = dt.date(year, month, day)
+            if candidate > snapshot_date:
+                year -= 1
+
+        try:
+            earnings_date = dt.date(year, month, day)
+        except ValueError:
+            return math.nan
+
+        if earnings_date > snapshot_date:
+            return math.nan
+
+        return float((snapshot_date - earnings_date).days)
+
     nodes = [
         ratio(16, 80),
         reciprocal(5),
@@ -332,6 +394,27 @@ def _compute_nodes(
         ratio(68, 3),
         raw(71),
         ratio(75, 80),
+        raw(29),
+        raw(34),
+        raw(35),
+        raw(47),
+        raw(48),
+        raw(49),
+        raw(50),
+        raw(51),
+        raw(53),
+        raw(54),
+        raw(55),
+        raw(56),
+        raw(57),
+        raw(58),
+        raw(59),
+        raw(60),
+        raw(61),
+        raw(62),
+        raw(63),
+        raw(64),
+        earnings_gap_days(65),
     ]
 
     for idx, value in enumerate(nodes, start=1):
@@ -506,7 +589,7 @@ def build_dataset(
             lookback_row = lookback_snapshot.df.loc[ticker]
 
             current_nodes = _compute_nodes(
-                current_row, snapshot.columns, snapshot.column_offset
+                current_row, snapshot.columns, snapshot.column_offset, snapshot.date
             )
             if current_nodes.values is None:
                 ticker_skip_counts["current_nodes"] += 1
@@ -517,7 +600,10 @@ def build_dataset(
                 continue
 
             lookback_nodes = _compute_nodes(
-                lookback_row, lookback_snapshot.columns, lookback_snapshot.column_offset
+                lookback_row,
+                lookback_snapshot.columns,
+                lookback_snapshot.column_offset,
+                lookback_snapshot.date,
             )
             if lookback_nodes.values is None:
                 ticker_skip_counts["lookback_nodes"] += 1
