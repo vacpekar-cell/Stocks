@@ -1184,9 +1184,9 @@ class NeuralNetApp:
             else:
                 messagebox.showerror("Chyba", "Nenalezen žádný scaler. Spusťte nejprve trénování!")
                 return
-            
-                with open(scaler_file, "rb") as f:
-                    scaler = pickle.load(f)
+
+            with open(scaler_file, "rb") as f:
+                scaler = pickle.load(f)
             
             try:
                 self.output_text.insert(tk.END, "Načítání dat pro predikci...\n")
