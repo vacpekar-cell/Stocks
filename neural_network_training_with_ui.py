@@ -147,6 +147,43 @@ def scaled_hidden_dims(input_dim: int) -> list[int]:
     return scaled
 
 
+HORIZON_ORDER = ["1w", "4w", "13w", "26w", "52w"]
+TARGET_COLUMN_ALIASES = {
+    "1w": {"target_1w", "1w", "1_week", "1-week", "1 week"},
+    "4w": {"target_4w", "4w", "4_week", "4-week", "4 week"},
+    "13w": {"target_13w", "13w", "13_week", "13-week", "13 week"},
+    "26w": {"target_26w", "26w", "26_week", "26-week", "26 week"},
+    "52w": {"target_52w", "52w", "52_week", "52-week", "52 week"},
+}
+
+
+def normalize_target_name(name: str) -> str:
+    lower = name.strip().lower()
+    if lower.startswith("target_"):
+        lower = lower.split("target_", 1)[1]
+    lower = lower.replace("weeks", "w").replace("week", "w").replace(" ", "")
+    return lower
+
+
+def map_columns_to_horizons(columns) -> dict:
+    mapping = {}
+    for col in columns:
+        normalized = normalize_target_name(str(col))
+        for horizon, aliases in TARGET_COLUMN_ALIASES.items():
+            if normalized in aliases:
+                mapping[horizon] = col
+                break
+    return mapping
+
+
+def infer_horizon_from_filename(path: str) -> str | None:
+    base = os.path.basename(path).lower()
+    for horizon in HORIZON_ORDER:
+        token = horizon.lower()
+        if f"_{token}_" in base or base.startswith(f"{token}_") or base.endswith(f"_{token}.pt"):
+            return horizon
+    return None
+
 def infer_output_dim_from_state_dict(state_dict) -> int:
     """Try to infer the number of output nodes stored in a checkpoint."""
 
@@ -313,13 +350,7 @@ class TrainingThread(threading.Thread):
                 mem_allocated = torch.cuda.memory_allocated() / 1024**2
                 self.app.thread_safe_logger.log(f"Výchozí využití GPU paměti: {mem_allocated:.1f}MB")
             
-            X_train_tensor = self.params['X_train']
-            y_train_tensor = self.params['y_train']
-            X_val_tensor = self.params['X_val']
-            y_val_tensor = self.params['y_val']
-            output_dim = self.params['output_dim']
-            
-            num_networks = self.params['num_networks']
+            target_tasks = self.params['target_tasks']
             batch_size = self.params['batch_size']
             epochs = self.params['epochs']
             dropout_rate = self.params['dropout_rate']
@@ -332,31 +363,33 @@ class TrainingThread(threading.Thread):
             learning_rate = self.params['learning_rate']
             weight_decay = self.params['weight_decay']
             use_sigmoid = self.params['use_sigmoid']
-            
-            best_model_id = None
-            best_val_loss = float('inf')
-            
-            for network_id in range(1, num_networks + 1):
+
+            pretrained_models = self.params.get('pretrained_models', {})
+
+            results = []
+
+            for task in target_tasks:
                 if self.stop_event.is_set():
                     self.app.thread_safe_logger.log("Trénování přerušeno uživatelem.")
                     break
-                    
-                self.app.current_network_id = str(network_id)
-                
-                # Pokud pokračujeme v tréninku a máme dostatek modelů, použijeme existující model
-                pretrained_model = None
-                if continue_training and network_id <= len(pretrained_models):
-                    pretrained_model = pretrained_models[network_id-1]
-                    self.app.thread_safe_logger.log(f"\n--- Pokračování tréninku sítě {network_id}/{num_networks} z modelu {os.path.basename(pretrained_model)} ---")
+
+                horizon = task['horizon']
+                self.app.current_network_id = horizon
+
+                pretrained_model = pretrained_models.get(horizon)
+                if continue_training and pretrained_model:
+                    self.app.thread_safe_logger.log(
+                        f"\n--- Pokračování tréninku horizontu {horizon} z modelu {os.path.basename(pretrained_model)} ---"
+                    )
                 else:
-                    self.app.thread_safe_logger.log(f"\n--- Trénování nové sítě {network_id}/{num_networks} ---")
-                
+                    self.app.thread_safe_logger.log(f"\n--- Trénování nového horizontu {horizon} ---")
+
                 val_loss = self.train_single_model(
-                    network_id=network_id,
-                    X_train=X_train_tensor,
-                    y_train=y_train_tensor,
-                    X_val=X_val_tensor,
-                    y_val=y_val_tensor,
+                    network_id=horizon,
+                    X_train=task['X_train'],
+                    y_train=task['y_train'],
+                    X_val=task['X_val'],
+                    y_val=task['y_val'],
                     timestamp=timestamp,
                     batch_size=batch_size,
                     epochs=epochs,
@@ -373,29 +406,18 @@ class TrainingThread(threading.Thread):
                     scheduler_type=scheduler_type,
                     min_lr=min_lr,
                     pretrained_model=pretrained_model,
-                    output_dim=output_dim
+                    output_dim=1
                 )
-                
+
                 if self.stop_event.is_set():
                     break
-                
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_model_id = network_id
-            
-            if not self.stop_event.is_set():
-                self.app.thread_safe_logger.log(f"\n=== Trénink dokončen (ID: {timestamp}) ===")
-                if best_model_id is not None:
-                    self.app.thread_safe_logger.log(f"Nejlepší model: Síť {best_model_id} s validační ztrátou {best_val_loss:.6f}")
-                
-                try:
-                    results_file = "training_results.csv"
-                    
-                    result_data = {
+
+                results.append(
+                    {
                         'timestamp': timestamp,
                         'model_type': 'resnet',
-                        'best_val_loss': best_val_loss,
-                        'best_network_id': best_model_id,
+                        'horizon': horizon,
+                        'val_loss': val_loss,
                         'continued_training': continue_training,
                         'epochs': epochs,
                         'batch_size': batch_size,
@@ -407,23 +429,29 @@ class TrainingThread(threading.Thread):
                         'scheduler_type': scheduler_type,
                         'noise_level': noise_level,
                         'mixup_prob': mixup_prob,
-                        'seed': seed
+                        'seed': seed,
                     }
-                    
-                    result_df = pd.DataFrame([result_data])
-                    
+                )
+
+            if not self.stop_event.is_set():
+                self.app.thread_safe_logger.log(f"\n=== Trénink dokončen (ID: {timestamp}) ===")
+
+                try:
+                    results_file = "training_results.csv"
+                    result_df = pd.DataFrame(results)
+
                     if os.path.exists(results_file):
                         existing_results = pd.read_csv(results_file)
                         updated_results = pd.concat([existing_results, result_df], ignore_index=True)
                         updated_results.to_csv(results_file, index=False)
                     else:
                         result_df.to_csv(results_file, index=False)
-                        
+
                     self.app.thread_safe_logger.log(f"Výsledky tréninku uloženy do '{results_file}'")
-                    
+
                 except Exception as e:
                     self.app.thread_safe_logger.log(f"Varování: Chyba při ukládání výsledků: {str(e)}")
-            
+
             self.app.root.after(0, self.app.enable_buttons)
             
         except Exception as e:
@@ -1081,24 +1109,16 @@ class NeuralNetApp:
                     return
                 
                 X = X_df.values
-                y = y_df.values
-
-                if y.ndim == 1:
-                    y = y.reshape(-1, 1)
-
-                output_dim = y.shape[1]
-                
                 scaler = MinMaxScaler()
                 X_scaled = scaler.fit_transform(X)
-                
+
                 scaler_file = f"scaler_{timestamp}.pkl"
                 with open(scaler_file, "wb") as f:
                     pickle.dump(scaler, f)
-                
+
                 seed = int(self.random_seed.get())
                 epochs = int(self.epochs.get())
                 batch_size = int(self.batch_size.get())
-                num_networks = 1
                 dropout_rate = float(self.dropout_rate.get())
                 use_augmentation = self.use_augmentation.get()
                 noise_level = float(self.noise_level.get())
@@ -1112,28 +1132,64 @@ class NeuralNetApp:
                 use_sigmoid = self.use_sigmoid.get()
                 weight_decay = float(self.weight_decay.get())
                 learning_rate = float(self.learning_rate.get())
-                
-                X_train, X_val, y_train, y_val = train_test_split(
-                    X_scaled, y, test_size=val_split, random_state=seed
+
+                column_mapping = map_columns_to_horizons(y_df.columns)
+                target_tasks = []
+                for horizon in HORIZON_ORDER:
+                    column = column_mapping.get(horizon)
+                    if column is None:
+                        continue
+                    series = y_df[column]
+                    mask = series.notna()
+                    if mask.sum() < 2:
+                        continue
+
+                    X_filtered = X_scaled[mask.values]
+                    y_filtered = series[mask].values.reshape(-1, 1)
+
+                    X_train, X_val, y_train, y_val = train_test_split(
+                        X_filtered, y_filtered, test_size=val_split, random_state=seed
+                    )
+
+                    target_tasks.append(
+                        {
+                            'horizon': horizon,
+                            'X_train': torch.FloatTensor(X_train),
+                            'y_train': torch.FloatTensor(y_train),
+                            'X_val': torch.FloatTensor(X_val),
+                            'y_val': torch.FloatTensor(y_val),
+                        }
+                    )
+
+                if not target_tasks:
+                    messagebox.showerror(
+                        "Chyba",
+                        "Výstupní CSV neobsahuje žádné použitelné cíle (očekávám sloupce target_1w/4w/13w/26w/52w).",
+                    )
+                    self.enable_buttons()
+                    return
+
+                self.output_text.insert(
+                    tk.END,
+                    f"K tréninku připraveno {len(target_tasks)} horizontů: {', '.join(task['horizon'] for task in target_tasks)}\n",
                 )
-                
-                X_train_tensor = torch.FloatTensor(X_train)
-                y_train_tensor = torch.FloatTensor(y_train)
-                X_val_tensor = torch.FloatTensor(X_val)
-                y_val_tensor = torch.FloatTensor(y_val)
-                
-                self.output_text.insert(tk.END, f"Rozdělení dat: {len(X_train)} trénovacích vzorků, {len(X_val)} validačních vzorků\n")
-                
-                network_ids = [str(i) for i in range(1, num_networks + 1)]
+
+                network_ids = [task['horizon'] for task in target_tasks]
                 self.network_selector['values'] = network_ids
                 if network_ids:
                     self.network_selector.current(0)
-                
+
+                pretrained_map = {}
+                if continue_training:
+                    for path in self.loaded_models:
+                        horizon = infer_horizon_from_filename(path)
+                        if horizon:
+                            pretrained_map[horizon] = path
+
                 params = {
                     'seed': seed,
                     'epochs': epochs,
                     'batch_size': batch_size,
-                    'num_networks': num_networks,
                     'dropout_rate': dropout_rate,
                     'use_augmentation': use_augmentation,
                     'noise_level': noise_level,
@@ -1147,15 +1203,11 @@ class NeuralNetApp:
                     'weight_decay': weight_decay,
                     'learning_rate': learning_rate,
                     'timestamp': timestamp,
-                    'X_train': X_train_tensor,
-                    'y_train': y_train_tensor,
-                    'X_val': X_val_tensor,
-                    'y_val': y_val_tensor,
-                    'output_dim': output_dim,
+                    'target_tasks': target_tasks,
                     'continue_training': continue_training,
-                    'pretrained_models': self.loaded_models if continue_training else []
+                    'pretrained_models': pretrained_map,
                 }
-                
+
                 self.training_thread = TrainingThread(self, params)
                 self.training_thread.start()
                 
@@ -1209,8 +1261,6 @@ class NeuralNetApp:
                 messagebox.showerror("Chyba", "Nejsou načteny žádné modely ani vybrán konkrétní model!")
                 return
 
-            model_file = models_to_use[0]
-            
             scaler_files = [f for f in os.listdir('.') if f.startswith('scaler_') and f.endswith('.pkl')]
             if scaler_files:
                 scaler_file = scaler_files[-1]
@@ -1265,19 +1315,23 @@ class NeuralNetApp:
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
-                state_dict = torch.load(model_file, map_location='cpu')
-                output_dim = infer_output_dim_from_state_dict(state_dict)
+                horizon_models = {}
+                for path in models_to_use:
+                    horizon = infer_horizon_from_filename(path)
+                    if horizon:
+                        horizon_models[horizon] = path
 
-                model = EfficientResNet(
-                    X_predict_scaled.shape[1],
-                    hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1]),
-                    use_sigmoid=self.use_sigmoid.get(),
-                    output_dim=output_dim
-                )
+                num_rows = X_predict_tensor.shape[0]
 
-                model.load_state_dict(state_dict)
-                model.to(device)
-                model.eval()
+                def inverse_target_transform(values: np.ndarray) -> np.ndarray:
+                    clipped = np.clip(values, 1e-6, 1 - 1e-6)
+                    z = np.arctanh(1 - 2 * clipped)
+                    return np.sign(z) * (np.abs(z) ** (4.0 / 3.0))
+
+                try:
+                    num_prediction_samples = max(1, int(self.pred_samples.get()))
+                except Exception:
+                    num_prediction_samples = 50
 
                 def run_single_pass(active_model):
                     pass_predictions = []
@@ -1296,60 +1350,84 @@ class NeuralNetApp:
 
                     return np.vstack(pass_predictions)
 
-                num_rows = X_predict_tensor.shape[0]
+                def predict_with_model(model_path: str, output_dim: int) -> tuple[np.ndarray, np.ndarray]:
+                    state_dict = torch.load(model_path, map_location='cpu')
+                    inferred_dim = infer_output_dim_from_state_dict(state_dict)
+                    if inferred_dim != output_dim:
+                        output_dim = inferred_dim
 
-                def inverse_target_transform(values: np.ndarray) -> np.ndarray:
-                    clipped = np.clip(values, 1e-6, 1 - 1e-6)
-                    z = np.arctanh(1 - 2 * clipped)
-                    return np.sign(z) * (np.abs(z) ** (4.0 / 3.0))
+                    model = EfficientResNet(
+                        X_predict_scaled.shape[1],
+                        hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1]),
+                        use_sigmoid=self.use_sigmoid.get(),
+                        output_dim=output_dim
+                    )
 
-                try:
-                    num_prediction_samples = max(1, int(self.pred_samples.get()))
-                except Exception:
-                    num_prediction_samples = 50
+                    model.load_state_dict(state_dict)
+                    model.to(device)
+                    model.train()
+                    for module in model.modules():
+                        if isinstance(module, nn.BatchNorm1d):
+                            module.eval()
 
-                # Monte Carlo dropout: povolíme dropout při inference a necháme
-                # BatchNorm ve stabilním režimu eval.
-                model.train()
-                for module in model.modules():
-                    if isinstance(module, nn.BatchNorm1d):
-                        module.eval()
+                    samples = []
+                    for _ in range(num_prediction_samples):
+                        samples.append(run_single_pass(model))
+
+                    sample_array = np.stack(samples)
+                    sample_array_raw = inverse_target_transform(sample_array)
+                    return sample_array_raw.mean(axis=0), sample_array_raw.std(axis=0)
 
                 self.output_text.insert(
                     tk.END,
                     f"Monte Carlo dropout aktivní, generuji {num_prediction_samples} vzorků.\n"
                 )
 
-                samples = []
-                for _ in range(num_prediction_samples):
-                    samples.append(run_single_pass(model))
+                results = {}
 
-                sample_array = np.stack(samples)
-                sample_array_raw = inverse_target_transform(sample_array)
-                mean_preds = sample_array_raw.mean(axis=0)
-                std_preds = sample_array_raw.std(axis=0)
+                if horizon_models:
+                    used_horizons = [h for h in HORIZON_ORDER if h in horizon_models]
+                    for horizon in used_horizons:
+                        mean_preds, std_preds = predict_with_model(horizon_models[horizon], 1)
+                        results[f"mean_{horizon}"] = mean_preds.reshape(-1)
+                        results[f"std_{horizon}"] = std_preds.reshape(-1)
+                        gamma_mean = mean_preds.reshape(-1) + 1.0
+                        gamma_mode = np.where(
+                            gamma_mean > 1e-8,
+                            np.clip(
+                                gamma_mean - (std_preds.reshape(-1) ** 2) / gamma_mean,
+                                a_min=0.0,
+                                a_max=None,
+                            ),
+                            np.nan,
+                        )
+                        results[f"gamma_mode_{horizon}"] = gamma_mode
+                else:
+                    fallback_model = models_to_use[0]
+                    mean_preds, std_preds = predict_with_model(fallback_model, 1)
+                    output_dim = mean_preds.shape[1] if mean_preds.ndim == 2 else 1
+                    horizons = HORIZON_ORDER[:output_dim]
+
+                    if mean_preds.ndim == 1:
+                        mean_preds = mean_preds.reshape(-1, 1)
+                        std_preds = std_preds.reshape(-1, 1)
+
+                    for j, horizon in enumerate(horizons):
+                        results[f"mean_{horizon}"] = mean_preds[:, j]
+                        results[f"std_{horizon}"] = std_preds[:, j]
+                        gamma_mean = mean_preds[:, j] + 1.0
+                        gamma_mode = np.where(
+                            gamma_mean > 1e-8,
+                            np.clip(
+                                gamma_mean - (std_preds[:, j] ** 2) / gamma_mean,
+                                a_min=0.0,
+                                a_max=None,
+                            ),
+                            np.nan,
+                        )
+                        results[f"gamma_mode_{horizon}"] = gamma_mode
 
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-
-                results = {}
-                # Targets in the dataset are ordered as 4w, 13w, 26w, so keep the
-                # exported prediction headers in the same order.
-                horizons = ["4w", "13w", "26w"]
-
-                for j, horizon in enumerate(horizons):
-                    results[f"mean_{horizon}"] = mean_preds[:, j]
-                    results[f"std_{horizon}"] = std_preds[:, j]
-                    gamma_mean = mean_preds[:, j] + 1.0
-                    gamma_mode = np.where(
-                        gamma_mean > 1e-8,
-                        np.clip(
-                            gamma_mean - (std_preds[:, j] ** 2) / gamma_mean,
-                            a_min=0.0,
-                            a_max=None,
-                        ),
-                        np.nan,
-                    )
-                    results[f"gamma_mode_{horizon}"] = gamma_mode
 
                 output_file = f"predictions_{timestamp}.csv"
                 output_df = pd.DataFrame(results)

@@ -5,8 +5,8 @@ The snapshots stored in this repository contain one row per ticker and dozens of
 columns copied from Finviz. Each file is named ``DD.MM.YYYY.xlsx`` and
 represents the situation at the close of a Friday session. The training setup
 requires 108 inputs (54 derived values from the "current" snapshot + the same
-54 values from the snapshot that is four weeks older) and three targets describing
-how the ticker performed 4, 13 and 26 weeks into the future.
+54 values from the snapshot that is four weeks older) and up to five targets
+describing how the ticker performed 1, 4, 13, 26 and 52 weeks into the future.
 
 The mapping between Excel columns (1-based) and neural network nodes is defined
 below. When any required value is missing the entire row is discarded, with the
@@ -16,11 +16,12 @@ fallback.
 For every snapshot that has the necessary neighbours the script:
 
 * locates the file that is four weeks older (look-back),
-* locates the files that are 4, 13 and 26 weeks newer (targets),
+* locates the files that are 1, 4, 13, 26 and 52 weeks newer when they exist
+  (targets),
 * matches rows by ticker symbol (column 2),
 * computes the 54 nodes for both current and look-back rows, and
-* reads target values from columns 48, 49 and 50 of the future snapshots, then
-  normalizes them as ``(1 - tanh(sign(x) * abs(x) ** 0.75)) / 2``.
+* reads target values from columns 47, 48, 49, 50 and 51 of the future
+  snapshots, then normalizes them as ``(1 - tanh(sign(x) * abs(x) ** 0.75)) / 2``.
 
 Outputs (saved under ``--output-dir``):
 
@@ -28,7 +29,10 @@ Outputs (saved under ``--output-dir``):
     The 66-node feature matrix.
 
 ``training_targets.csv``
-    Three regression targets: 4w, 13w and 26w performance.
+    Up to five regression targets (columns ``target_1w``, ``target_4w``,
+    ``target_13w``, ``target_26w``, ``target_52w``). Rows with missing future
+    snapshots keep ``NaN`` for the unavailable horizons so that shorter-horizon
+    models can still use the data.
 
 ``training_metadata.csv``
     Ticker and timestamp provenance for each row, useful for debugging or
@@ -59,7 +63,7 @@ RELAXED_DATE_PATTERN = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:[ _-].*)?$"
 TICKER_COLUMN_INDEX = 2  # according to the original Finviz export layout
 MAGNITUDE_SUFFIXES = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
 BOOL_MAP = {"yes": 1.0, "no": 0.0}
-TARGET_COLUMN_INDEX = {4: 48, 13: 49, 26: 50}
+TARGET_COLUMN_INDEX = {1: 47, 4: 48, 13: 49, 26: 50, 52: 51}
 WEEKEND_TOLERANCE_DAYS = 2  # allow Saturday/Sunday captures to pair with Friday baselines
 NODE_COUNT = 54
 BASE_INPUT_DIM = 66  # historical input dimensionality used for proportional scaling
@@ -549,19 +553,17 @@ def build_dataset(
             continue
 
         future_indices: Dict[int, int] = {}
-        for weeks, column_idx in TARGET_COLUMN_INDEX.items():
+        for weeks in TARGET_COLUMN_INDEX:
             target_idx = _find_neighbor_index(
                 idx, snapshots, weeks * 7, direction=1
             )
             if target_idx is None:
-                break
-            future_indices[weeks] = target_idx
-
-        if len(future_indices) != len(TARGET_COLUMN_INDEX):
-            missing_weeks = sorted(set(TARGET_COLUMN_INDEX) - set(future_indices))
-            for weeks in missing_weeks:
                 skip_reason_counts["missing_future"][weeks] += 1
                 _log_missing_neighbor(snapshot, f"budoucí ({weeks}t)", weeks * 7, direction=1)
+                continue
+            future_indices[weeks] = target_idx
+
+        if not future_indices:
             continue
 
         lookback_snapshot = snapshots[lookback_idx]
@@ -614,7 +616,6 @@ def build_dataset(
                 continue
 
             targets: Dict[int, float] = {}
-            target_valid = True
             for weeks, future_snapshot in future_snapshots.items():
                 column_index = TARGET_COLUMN_INDEX[weeks]
                 future_row = future_snapshot.df.loc[ticker]
@@ -625,12 +626,11 @@ def build_dataset(
                     future_snapshot.column_offset,
                 )
                 if value is None:
-                    target_valid = False
                     target_failure_counts[weeks] += 1
-                    break
+                    continue
                 targets[weeks] = value
 
-            if not target_valid:
+            if not targets:
                 ticker_skip_counts["targets"] += 1
                 snapshot_target_fail += 1
                 continue
@@ -638,9 +638,10 @@ def build_dataset(
             feature_rows.append(current_nodes.values + lookback_nodes.values)
             target_rows.append(
                 [
-                    _normalize_target(targets[4]),
-                    _normalize_target(targets[13]),
-                    _normalize_target(targets[26]),
+                    _normalize_target(targets.get(weeks, math.nan))
+                    if weeks in targets
+                    else math.nan
+                    for weeks in TARGET_COLUMN_INDEX
                 ]
             )
             metadata_rows.append(
@@ -648,9 +649,11 @@ def build_dataset(
                     "Ticker": ticker,
                     "base_snapshot": snapshot.date.isoformat(),
                     "lookback_snapshot": lookback_snapshot.date.isoformat(),
-                    "target_4w_snapshot": future_snapshots[4].date.isoformat(),
-                    "target_13w_snapshot": future_snapshots[13].date.isoformat(),
-                    "target_26w_snapshot": future_snapshots[26].date.isoformat(),
+                    **{
+                        f"target_{weeks}w_snapshot": future_snapshots.get(weeks)
+                        and future_snapshots[weeks].date.isoformat()
+                        for weeks in TARGET_COLUMN_INDEX
+                    },
                 }
             )
             snapshot_success += 1
@@ -679,7 +682,10 @@ def build_dataset(
     ]
 
     features_df = pd.DataFrame(feature_rows, columns=feature_columns)
-    targets_df = pd.DataFrame(target_rows, columns=["target_4w", "target_13w", "target_26w"])
+    targets_df = pd.DataFrame(
+        target_rows,
+        columns=["target_1w", "target_4w", "target_13w", "target_26w", "target_52w"],
+    )
     metadata_df = pd.DataFrame(metadata_rows)
 
     logging.info(
@@ -690,11 +696,13 @@ def build_dataset(
     )
 
     logging.info(
-        "Diagnostika snapshotů – bez staršího: %s, budoucí 4t: %s, 13t: %s, 26t: %s, bez tickerů: %s.",
+        "Diagnostika snapshotů – bez staršího: %s, budoucí 1t: %s, 4t: %s, 13t: %s, 26t: %s, 52t: %s, bez tickerů: %s.",
         skip_reason_counts["missing_lookback"],
+        skip_reason_counts["missing_future"][1],
         skip_reason_counts["missing_future"][4],
         skip_reason_counts["missing_future"][13],
         skip_reason_counts["missing_future"][26],
+        skip_reason_counts["missing_future"][52],
         skip_reason_counts["missing_tickers"],
     )
     logging.info(
@@ -712,10 +720,12 @@ def build_dataset(
         _format_node_failures(node_failure_counts["lookback"]),
     )
     logging.info(
-        "Diagnostika cílů – 4t: %s, 13t: %s, 26t: %s",
+        "Diagnostika cílů – 1t: %s, 4t: %s, 13t: %s, 26t: %s, 52t: %s",
+        target_failure_counts[1],
         target_failure_counts[4],
         target_failure_counts[13],
         target_failure_counts[26],
+        target_failure_counts[52],
     )
 
     return features_df, targets_df, metadata_df
