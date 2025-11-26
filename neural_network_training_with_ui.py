@@ -100,10 +100,10 @@ class ResidualBlock(nn.Module):
 
 # Enhanced ResNet model for financial predictions
 class EfficientResNet(nn.Module):
-    def __init__(self, input_dim, hidden_dims=[512, 256, 128, 64], dropout_rate=0.25, use_sigmoid=True):
+    def __init__(self, input_dim, hidden_dims=[512, 256, 128, 64], dropout_rate=0.25, use_sigmoid=True, output_dim=3):
         super(EfficientResNet, self).__init__()
         self.use_sigmoid = use_sigmoid
-        
+
         layers = [
             nn.Linear(input_dim, hidden_dims[0]),
             nn.BatchNorm1d(hidden_dims[0]),
@@ -113,10 +113,10 @@ class EfficientResNet(nn.Module):
         
         for i in range(len(hidden_dims)-1):
             layers.append(ResidualBlock(hidden_dims[i], hidden_dims[i+1], dropout_rate=dropout_rate*(0.9**i)))
-        
+
         self.feature_extractor = nn.Sequential(*layers)
-        self.output_layer = nn.Linear(hidden_dims[-1], 3)
-        
+        self.output_layer = nn.Linear(hidden_dims[-1], output_dim)
+
         self._initialize_weights()
         
     def _initialize_weights(self):
@@ -145,6 +145,18 @@ def scaled_hidden_dims(input_dim: int) -> list[int]:
     ratio = input_dim / base_input
     scaled = [max(32, int(round(dim * ratio))) for dim in base_dims]
     return scaled
+
+
+def infer_output_dim_from_state_dict(state_dict) -> int:
+    """Try to infer the number of output nodes stored in a checkpoint."""
+
+    if "output_layer.weight" in state_dict:
+        return state_dict["output_layer.weight"].shape[0]
+
+    if "output_layer.bias" in state_dict:
+        return state_dict["output_layer.bias"].shape[0]
+
+    raise ValueError("Nelze určit výstupní dimenzi z poskytnutého checkpointu.")
 
 # Thread-safe logger
 class ThreadSafeLogger:
@@ -305,6 +317,7 @@ class TrainingThread(threading.Thread):
             y_train_tensor = self.params['y_train']
             X_val_tensor = self.params['X_val']
             y_val_tensor = self.params['y_val']
+            output_dim = self.params['output_dim']
             
             num_networks = self.params['num_networks']
             batch_size = self.params['batch_size']
@@ -359,7 +372,8 @@ class TrainingThread(threading.Thread):
                     dropout_rate=dropout_rate,
                     scheduler_type=scheduler_type,
                     min_lr=min_lr,
-                    pretrained_model=pretrained_model
+                    pretrained_model=pretrained_model,
+                    output_dim=output_dim
                 )
                 
                 if self.stop_event.is_set():
@@ -418,12 +432,12 @@ class TrainingThread(threading.Thread):
             self.app.thread_safe_logger.log(error_msg)
             self.app.root.after(0, self.app.enable_buttons)
     
-    def train_single_model(self, network_id, X_train, y_train, X_val, y_val, timestamp, 
+    def train_single_model(self, network_id, X_train, y_train, X_val, y_val, timestamp,
                            batch_size, epochs, patience, device, use_mixed_precision=False,
                            use_augmentation=False, noise_level=0.03, mixup_prob=0.2,
                            learning_rate=0.001, weight_decay=0.0001, use_sigmoid=True,
                            dropout_rate=0.25, scheduler_type='cosine', min_lr='1e-6',
-                           pretrained_model=None):
+                           pretrained_model=None, output_dim=3):
         try:
             if self.stop_event.is_set():
                 return float('inf')
@@ -436,8 +450,21 @@ class TrainingThread(threading.Thread):
                 mem_allocated = torch.cuda.memory_allocated() / 1024**2
                 self.app.thread_safe_logger.log(f"GPU využití před tréninkem: {mem_allocated:.1f}MB")
             
+            if pretrained_model:
+                pretrained_state = torch.load(pretrained_model, map_location='cpu')
+                inferred_dim = infer_output_dim_from_state_dict(pretrained_state)
+                if inferred_dim != output_dim:
+                    self.app.thread_safe_logger.log(
+                        f"Upravena výstupní dimenze na {inferred_dim} podle checkpointu {os.path.basename(pretrained_model)}"
+                    )
+                    output_dim = inferred_dim
+                    if y_train.shape[1] != output_dim:
+                        raise ValueError(
+                            f"Checkpoint očekává {output_dim} cílových sloupců, ale dataset má {y_train.shape[1]}"
+                        )
+
             if use_augmentation:
-                train_dataset = FinancialDataset(X_train, y_train, transform=True, 
+                train_dataset = FinancialDataset(X_train, y_train, transform=True,
                                               noise_level=noise_level, mixup_prob=mixup_prob)
             else:
                 train_dataset = TensorDataset(X_train, y_train)
@@ -456,24 +483,25 @@ class TrainingThread(threading.Thread):
             )
             
             val_loader = DataLoader(
-                val_dataset, 
+                val_dataset,
                 batch_size=batch_size*2,
-                shuffle=False, 
+                shuffle=False,
                 num_workers=num_workers,
                 pin_memory=pin_memory
             )
-            
+
             model = EfficientResNet(
                 X_train.shape[1],
                 hidden_dims=scaled_hidden_dims(X_train.shape[1]),
                 dropout_rate=dropout_rate,
-                use_sigmoid=use_sigmoid
+                use_sigmoid=use_sigmoid,
+                output_dim=output_dim
             )
             
             # Načtení předtrénovaného modelu, pokud je k dispozici
             if pretrained_model:
                 self.app.thread_safe_logger.log(f"Načítání vah z modelu: {os.path.basename(pretrained_model)}")
-                model.load_state_dict(torch.load(pretrained_model, map_location=device))
+                model.load_state_dict(pretrained_state)
                 
             model.to(device)
             
@@ -1054,6 +1082,11 @@ class NeuralNetApp:
                 
                 X = X_df.values
                 y = y_df.values
+
+                if y.ndim == 1:
+                    y = y.reshape(-1, 1)
+
+                output_dim = y.shape[1]
                 
                 scaler = MinMaxScaler()
                 X_scaled = scaler.fit_transform(X)
@@ -1118,6 +1151,7 @@ class NeuralNetApp:
                     'y_train': y_train_tensor,
                     'X_val': X_val_tensor,
                     'y_val': y_val_tensor,
+                    'output_dim': output_dim,
                     'continue_training': continue_training,
                     'pretrained_models': self.loaded_models if continue_training else []
                 }
@@ -1231,13 +1265,17 @@ class NeuralNetApp:
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
+                state_dict = torch.load(model_file, map_location='cpu')
+                output_dim = infer_output_dim_from_state_dict(state_dict)
+
                 model = EfficientResNet(
                     X_predict_scaled.shape[1],
                     hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1]),
-                    use_sigmoid=self.use_sigmoid.get()
+                    use_sigmoid=self.use_sigmoid.get(),
+                    output_dim=output_dim
                 )
 
-                model.load_state_dict(torch.load(model_file, map_location=device))
+                model.load_state_dict(state_dict)
                 model.to(device)
                 model.eval()
 
