@@ -184,6 +184,17 @@ def infer_horizon_from_filename(path: str) -> str | None:
             return horizon
     return None
 
+
+def infer_timestamp_from_model(path: str) -> str | None:
+    base = os.path.basename(path)
+    name = os.path.splitext(base)[0]
+    parts = name.split("_")
+
+    if len(parts) >= 4 and parts[0] == "model" and parts[1] == "resnet":
+        return parts[-1]
+
+    return None
+
 def infer_output_dim_from_state_dict(state_dict) -> int:
     """Try to infer the number of output nodes stored in a checkpoint."""
 
@@ -997,6 +1008,32 @@ class NeuralNetApp:
             self.loaded_models_var.set("Žádné modely načteny")
             self.output_text.insert(tk.END, "Žádné modely nebyly načteny.\n")
         self.output_text.see(tk.END)
+
+    def load_validation_indices(self):
+        indices_map = {}
+
+        for model_path in self.loaded_models:
+            timestamp = infer_timestamp_from_model(model_path)
+            if not timestamp:
+                continue
+
+            candidate = f"val_indices_{timestamp}.pkl"
+            if not os.path.exists(candidate):
+                continue
+
+            try:
+                with open(candidate, "rb") as f:
+                    data = pickle.load(f)
+
+                if isinstance(data, dict):
+                    indices_map = {k: np.array(v) for k, v in data.items()}
+                    self.output_text.insert(tk.END, f"Načteny validační indexy z '{candidate}'.\n")
+                    break
+            except Exception as e:
+                self.output_text.insert(tk.END, f"Varování: Nepodařilo se načíst validační indexy: {e}\n")
+
+        self.output_text.see(tk.END)
+        return indices_map
     
     def clear_log(self):
         self.output_text.delete(1.0, tk.END)
@@ -1135,6 +1172,10 @@ class NeuralNetApp:
 
                 column_mapping = map_columns_to_horizons(y_df.columns)
                 target_tasks = []
+                val_indices_to_save = {}
+
+                saved_val_indices = self.load_validation_indices() if continue_training else {}
+
                 for horizon in HORIZON_ORDER:
                     column = column_mapping.get(horizon)
                     if column is None:
@@ -1144,12 +1185,31 @@ class NeuralNetApp:
                     if mask.sum() < 2:
                         continue
 
-                    X_filtered = X_scaled[mask.values]
-                    y_filtered = series[mask].values.reshape(-1, 1)
+                    horizon_indices = np.nonzero(mask.values)[0]
+                    y_values = series.values.reshape(-1, 1)
 
-                    X_train, X_val, y_train, y_val = train_test_split(
-                        X_filtered, y_filtered, test_size=val_split, random_state=seed
-                    )
+                    preset_val_idx = saved_val_indices.get(horizon)
+                    if preset_val_idx is not None:
+                        preset_val_idx = [idx for idx in preset_val_idx if idx < len(X_scaled)]
+                        train_idx = [idx for idx in horizon_indices if idx not in preset_val_idx]
+                        val_idx = preset_val_idx
+                        if not val_idx:
+                            self.output_text.insert(tk.END, f"Varování: Žádné uložené validační indexy pro {horizon}, provádím nový split.\n")
+                            train_idx, val_idx = train_test_split(
+                                horizon_indices, test_size=val_split, random_state=seed
+                            )
+                        else:
+                            self.output_text.insert(tk.END, f"Používám uložené validační indexy pro {horizon}.\n")
+                    else:
+                        train_idx, val_idx = train_test_split(
+                            horizon_indices, test_size=val_split, random_state=seed
+                        )
+
+                    val_indices_to_save[horizon] = np.array(val_idx)
+                    X_train = X_scaled[train_idx]
+                    X_val = X_scaled[val_idx]
+                    y_train = y_values[train_idx]
+                    y_val = y_values[val_idx]
 
                     target_tasks.append(
                         {
@@ -1168,6 +1228,12 @@ class NeuralNetApp:
                     )
                     self.enable_buttons()
                     return
+
+                if val_indices_to_save:
+                    val_index_file = f"val_indices_{timestamp}.pkl"
+                    with open(val_index_file, "wb") as f:
+                        pickle.dump(val_indices_to_save, f)
+                    self.output_text.insert(tk.END, f"Validační indexy uloženy do '{val_index_file}'.\n")
 
                 self.output_text.insert(
                     tk.END,
