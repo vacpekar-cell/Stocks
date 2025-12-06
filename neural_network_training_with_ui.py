@@ -139,12 +139,45 @@ class EfficientResNet(nn.Module):
         return x
 
 
+class ErrorEstimator(nn.Module):
+    """Predict the absolute error of the primary model for a given horizon."""
+
+    def __init__(self, input_dim, hidden_dims=None, dropout_rate=0.1):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = scaled_hidden_dims(input_dim)
+
+        self.backbone = EfficientResNet(
+            input_dim,
+            hidden_dims=hidden_dims,
+            dropout_rate=dropout_rate,
+            use_sigmoid=False,
+            output_dim=1,
+        )
+
+    def forward(self, x):
+        raw = self.backbone(x)
+        return F.softplus(raw)
+
+
 def scaled_hidden_dims(input_dim: int) -> list[int]:
     base_input = 66
     base_dims = [512, 256, 128, 64]
     ratio = input_dim / base_input
     scaled = [max(32, int(round(dim * ratio))) for dim in base_dims]
     return scaled
+
+
+def inverse_target_transform(values):
+    if torch.is_tensor(values):
+        clipped = torch.clamp(values, 1e-6, 1 - 1e-6)
+        z = torch.atanh(1 - 2 * clipped)
+        return torch.sign(z) * torch.pow(torch.abs(z), 4.0 / 3.0)
+
+    arr = np.asarray(values)
+    clipped = np.clip(arr, 1e-6, 1 - 1e-6)
+    z = np.arctanh(1 - 2 * clipped)
+    return np.sign(z) * (np.abs(z) ** (4.0 / 3.0))
 
 
 HORIZON_ORDER = ["1w", "4w", "13w", "26w", "52w"]
@@ -678,34 +711,38 @@ class TrainingThread(threading.Thread):
             logger.finish()
 
             model_file = f"model_resnet_{network_id}_{timestamp}.pt"
-            uncertainty_file = f"uncertainty_{os.path.splitext(model_file)[0]}.npy"
-
-            # Kalibrace šumu na základě validačních reziduí
             model.load_state_dict(best_model_state)
             model.to(device)
             model.eval()
-
-            residuals = []
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs = inputs.to(device, non_blocking=True)
-                    targets = targets.to(device, non_blocking=True)
-                    outputs = model(inputs)
-                    residuals.append((outputs - targets).cpu())
-
-            if residuals:
-                residuals_cat = torch.cat(residuals)
-                residual_std = residuals_cat.std(dim=0).numpy()
-                np.save(uncertainty_file, residual_std)
-                self.app.thread_safe_logger.log(
-                    f"Odhad nejistoty uložen jako '{uncertainty_file}'"
-                )
 
             torch.save(best_model_state, model_file)
 
             self.app.thread_safe_logger.log(f"Síť {network_id} dokončena. Nejlepší validační ztráta: {best_val_loss:.6f}")
             self.app.thread_safe_logger.log(f"Model uložen jako '{model_file}'")
-            
+
+            try:
+                meta_loss = self.train_meta_model(
+                    network_id,
+                    timestamp,
+                    model_state=best_model_state,
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_val=X_val,
+                    y_val=y_val,
+                    batch_size=batch_size,
+                    device=device,
+                    use_mixed_precision=use_mixed_precision,
+                    dropout_rate=dropout_rate,
+                    use_sigmoid=use_sigmoid,
+                )
+                self.app.thread_safe_logger.log(
+                    f"Metasíť pro horizont {network_id} dokončena. Nejlepší validační ztráta: {meta_loss:.6f}"
+                )
+            except Exception as exc:
+                self.app.thread_safe_logger.log(
+                    f"Varování: trénink metasítě pro {network_id} selhal: {exc}"
+                )
+
             plot_data = logger.get_plotting_data()
             self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(network_id), plot_data))
             
@@ -716,12 +753,166 @@ class TrainingThread(threading.Thread):
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            
+
             return best_val_loss
-            
+
         except Exception as e:
             import traceback
-            error_msg = f"CHYBA při tréninku sítě {network_id}: {str(e)}\n{traceback.format_exc()}"
+            error_msg = f"\nCHYBA při tréninku sítě {network_id}: {str(e)}\n{traceback.format_exc()}"
+            self.app.thread_safe_logger.log(error_msg)
+            return float('inf')
+
+    def train_meta_model(
+        self,
+        network_id,
+        timestamp,
+        model_state,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        batch_size,
+        device,
+        use_mixed_precision,
+        dropout_rate,
+        use_sigmoid,
+    ):
+        try:
+            base_model = EfficientResNet(
+                X_train.shape[1],
+                hidden_dims=scaled_hidden_dims(X_train.shape[1]),
+                dropout_rate=dropout_rate,
+                use_sigmoid=use_sigmoid,
+                output_dim=1,
+            )
+            base_model.load_state_dict(model_state)
+            base_model.to(device)
+            base_model.eval()
+
+            def build_meta_parts(features: torch.Tensor, targets: torch.Tensor):
+                with torch.no_grad():
+                    preds = base_model(features.to(device, non_blocking=True))
+                    preds_raw = inverse_target_transform(preds).cpu()
+                target_raw = inverse_target_transform(targets).cpu()
+                meta_inputs = torch.cat([features.cpu(), preds_raw], dim=1)
+                meta_targets = torch.abs(preds_raw - target_raw)
+                return meta_inputs, meta_targets
+
+            train_meta_X, train_meta_y = build_meta_parts(X_train, y_train)
+            val_meta_X, val_meta_y = build_meta_parts(X_val, y_val)
+
+            meta_model = ErrorEstimator(
+                train_meta_X.shape[1],
+                hidden_dims=scaled_hidden_dims(train_meta_X.shape[1]),
+                dropout_rate=dropout_rate * 0.5,
+            )
+            meta_model.to(device)
+
+            optimizer = torch.optim.AdamW(meta_model.parameters(), lr=1e-3, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
+            criterion = nn.MSELoss()
+            scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
+
+            train_loader = DataLoader(
+                TensorDataset(train_meta_X, train_meta_y),
+                batch_size=batch_size,
+                shuffle=True,
+            )
+            val_loader = DataLoader(
+                TensorDataset(val_meta_X, val_meta_y),
+                batch_size=batch_size * 2,
+                shuffle=False,
+            )
+
+            best_val_loss = float('inf')
+            best_state = None
+            patience = 20
+            patience_counter = 0
+            meta_epochs = 150
+
+            for epoch in range(meta_epochs):
+                if self.stop_event.is_set():
+                    break
+
+                meta_model.train()
+                train_loss = 0.0
+
+                for inputs, targets in train_loader:
+                    inputs = inputs.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
+
+                    optimizer.zero_grad()
+
+                    if use_mixed_precision:
+                        with torch.cuda.amp.autocast():
+                            outputs = meta_model(inputs)
+                            loss = criterion(outputs, targets)
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(meta_model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        outputs = meta_model(inputs)
+                        loss = criterion(outputs, targets)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(meta_model.parameters(), 1.0)
+                        optimizer.step()
+
+                    train_loss += loss.item() * inputs.size(0)
+
+                train_loss /= len(train_loader.dataset)
+
+                meta_model.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for inputs, targets in val_loader:
+                        inputs = inputs.to(device, non_blocking=True)
+                        targets = targets.to(device, non_blocking=True)
+
+                        if use_mixed_precision:
+                            with torch.cuda.amp.autocast():
+                                outputs = meta_model(inputs)
+                                loss = criterion(outputs, targets)
+                        else:
+                            outputs = meta_model(inputs)
+                            loss = criterion(outputs, targets)
+
+                        val_loss += loss.item() * inputs.size(0)
+
+                val_loss /= len(val_loader.dataset)
+                scheduler.step()
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state = {k: v.cpu() for k, v in meta_model.state_dict().items()}
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= patience:
+                    break
+
+            if best_state is not None:
+                meta_model.load_state_dict(best_state)
+
+            meta_model_file = f"meta_resnet_{network_id}_{timestamp}.pt"
+            torch.save(meta_model.state_dict(), meta_model_file)
+            self.app.thread_safe_logger.log(f"Metasíť uložena jako '{meta_model_file}'")
+
+            del base_model, meta_model, optimizer, criterion
+            if scaler is not None:
+                del scaler
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            return best_val_loss
+
+        except Exception as e:
+            import traceback
+            error_msg = f"CHYBA při tréninku metasítě {network_id}: {str(e)}\n{traceback.format_exc()}"
             self.app.thread_safe_logger.log(error_msg)
             return float('inf')
 
@@ -1389,34 +1580,12 @@ class NeuralNetApp:
 
                 num_rows = X_predict_tensor.shape[0]
 
-                def inverse_target_transform(values: np.ndarray) -> np.ndarray:
-                    clipped = np.clip(values, 1e-6, 1 - 1e-6)
-                    z = np.arctanh(1 - 2 * clipped)
-                    return np.sign(z) * (np.abs(z) ** (4.0 / 3.0))
+                self.output_text.insert(
+                    tk.END,
+                    "Dropout během predikce je vypnutý, používám deterministické výstupy a metasíť pro odhad chyby.\n",
+                )
 
-                try:
-                    num_prediction_samples = max(1, int(self.pred_samples.get()))
-                except Exception:
-                    num_prediction_samples = 50
-
-                def run_single_pass(active_model):
-                    pass_predictions = []
-                    with torch.no_grad():
-                        for start in range(0, num_rows, batch_size):
-                            end = min(start + batch_size, num_rows)
-                            batch_data = X_predict_tensor[start:end].to(device, non_blocking=True)
-
-                            if use_mixed_precision:
-                                with torch.cuda.amp.autocast():
-                                    batch_predictions = active_model(batch_data).cpu().numpy()
-                            else:
-                                batch_predictions = active_model(batch_data).cpu().numpy()
-
-                            pass_predictions.append(batch_predictions)
-
-                    return np.vstack(pass_predictions)
-
-                def predict_with_model(model_path: str, output_dim: int) -> tuple[np.ndarray, np.ndarray]:
+                def predict_with_model(model_path: str, output_dim: int) -> np.ndarray:
                     state_dict = torch.load(model_path, map_location='cpu')
                     inferred_dim = infer_output_dim_from_state_dict(state_dict)
                     if inferred_dim != output_dim:
@@ -1431,67 +1600,114 @@ class NeuralNetApp:
 
                     model.load_state_dict(state_dict)
                     model.to(device)
-                    model.train()
-                    for module in model.modules():
-                        if isinstance(module, nn.BatchNorm1d):
-                            module.eval()
+                    model.eval()
 
-                    samples = []
-                    for _ in range(num_prediction_samples):
-                        samples.append(run_single_pass(model))
+                    pass_predictions = []
+                    with torch.no_grad():
+                        for start in range(0, num_rows, batch_size):
+                            end = min(start + batch_size, num_rows)
+                            batch_data = X_predict_tensor[start:end].to(device, non_blocking=True)
 
-                    sample_array = np.stack(samples)
-                    sample_array_raw = inverse_target_transform(sample_array)
-                    return sample_array_raw.mean(axis=0), sample_array_raw.std(axis=0)
+                            if use_mixed_precision:
+                                with torch.cuda.amp.autocast():
+                                    batch_predictions = model(batch_data)
+                            else:
+                                batch_predictions = model(batch_data)
 
-                self.output_text.insert(
-                    tk.END,
-                    f"Monte Carlo dropout aktivní, generuji {num_prediction_samples} vzorků.\n"
-                )
+                            pass_predictions.append(batch_predictions.cpu())
+
+                    stacked = torch.cat(pass_predictions)
+                    return inverse_target_transform(stacked).cpu().numpy()
+
+                def find_meta_model_path(base_model_path: str, horizon: str | None):
+                    timestamp = infer_timestamp_from_model(base_model_path)
+                    if horizon is None or timestamp is None:
+                        return None
+
+                    candidate = f"meta_resnet_{horizon}_{timestamp}.pt"
+                    base_dir = os.path.dirname(base_model_path) or "."
+                    full_candidate = os.path.join(base_dir, candidate)
+
+                    if os.path.exists(full_candidate):
+                        return full_candidate
+                    if os.path.exists(candidate):
+                        return candidate
+                    return None
+
+                def predict_meta_errors(meta_model_path: str, base_predictions: np.ndarray) -> np.ndarray:
+                    state_dict = torch.load(meta_model_path, map_location='cpu')
+                    meta_model = ErrorEstimator(
+                        X_predict_scaled.shape[1] + 1,
+                        hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1] + 1),
+                        dropout_rate=float(self.dropout_rate.get()) * 0.5,
+                    )
+                    meta_model.load_state_dict(state_dict)
+                    meta_model.to(device)
+                    meta_model.eval()
+
+                    meta_inputs = torch.cat(
+                        [
+                            X_predict_tensor,
+                            torch.as_tensor(base_predictions, dtype=torch.float32).reshape(-1, 1),
+                        ],
+                        dim=1,
+                    )
+
+                    meta_preds = []
+                    with torch.no_grad():
+                        for start in range(0, num_rows, batch_size):
+                            end = min(start + batch_size, num_rows)
+                            batch_data = meta_inputs[start:end].to(device, non_blocking=True)
+
+                            if use_mixed_precision:
+                                with torch.cuda.amp.autocast():
+                                    batch_predictions = meta_model(batch_data)
+                            else:
+                                batch_predictions = meta_model(batch_data)
+
+                            meta_preds.append(batch_predictions.cpu())
+
+                    return torch.cat(meta_preds).numpy().reshape(-1)
 
                 results = {}
 
                 if horizon_models:
                     used_horizons = [h for h in HORIZON_ORDER if h in horizon_models]
                     for horizon in used_horizons:
-                        mean_preds, std_preds = predict_with_model(horizon_models[horizon], 1)
-                        results[f"mean_{horizon}"] = mean_preds.reshape(-1)
-                        results[f"std_{horizon}"] = std_preds.reshape(-1)
-                        gamma_mean = mean_preds.reshape(-1) + 1.0
-                        gamma_mode = np.where(
-                            gamma_mean > 1e-8,
-                            np.clip(
-                                gamma_mean - (std_preds.reshape(-1) ** 2) / gamma_mean,
-                                a_min=0.0,
-                                a_max=None,
-                            ),
-                            np.nan,
-                        )
-                        results[f"gamma_mode_{horizon}"] = gamma_mode
+                        mean_preds = predict_with_model(horizon_models[horizon], 1).reshape(-1)
+                        results[f"mean_{horizon}"] = mean_preds
+
+                        meta_model_path = find_meta_model_path(horizon_models[horizon], horizon)
+                        if meta_model_path:
+                            results[f"error_{horizon}"] = predict_meta_errors(meta_model_path, mean_preds)
+                        else:
+                            self.output_text.insert(
+                                tk.END,
+                                f"Nebyl nalezen meta-model pro horizont {horizon}, odhady chyby budou NaN.\n",
+                            )
+                            results[f"error_{horizon}"] = np.full_like(mean_preds, np.nan, dtype=float)
                 else:
                     fallback_model = models_to_use[0]
-                    mean_preds, std_preds = predict_with_model(fallback_model, 1)
+                    mean_preds = predict_with_model(fallback_model, 1)
                     output_dim = mean_preds.shape[1] if mean_preds.ndim == 2 else 1
                     horizons = HORIZON_ORDER[:output_dim]
 
                     if mean_preds.ndim == 1:
                         mean_preds = mean_preds.reshape(-1, 1)
-                        std_preds = std_preds.reshape(-1, 1)
 
                     for j, horizon in enumerate(horizons):
-                        results[f"mean_{horizon}"] = mean_preds[:, j]
-                        results[f"std_{horizon}"] = std_preds[:, j]
-                        gamma_mean = mean_preds[:, j] + 1.0
-                        gamma_mode = np.where(
-                            gamma_mean > 1e-8,
-                            np.clip(
-                                gamma_mean - (std_preds[:, j] ** 2) / gamma_mean,
-                                a_min=0.0,
-                                a_max=None,
-                            ),
-                            np.nan,
-                        )
-                        results[f"gamma_mode_{horizon}"] = gamma_mode
+                        horizon_preds = mean_preds[:, j]
+                        results[f"mean_{horizon}"] = horizon_preds
+
+                        base_meta_path = find_meta_model_path(fallback_model, horizon)
+                        if base_meta_path:
+                            results[f"error_{horizon}"] = predict_meta_errors(base_meta_path, horizon_preds)
+                        else:
+                            self.output_text.insert(
+                                tk.END,
+                                f"Nebyl nalezen meta-model pro horizont {horizon}, odhady chyby budou NaN.\n",
+                            )
+                            results[f"error_{horizon}"] = np.full_like(horizon_preds, np.nan, dtype=float)
 
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
 
