@@ -224,6 +224,10 @@ def infer_timestamp_from_model(path: str) -> str | None:
     parts = name.split("_")
 
     if len(parts) >= 4 and parts[0] == "model" and parts[1] == "resnet":
+        # Typical pattern: model_resnet_<horizon>_YYYYMMDD_HHMMSS
+        if len(parts) >= 5 and parts[-2].isdigit() and len(parts[-2]) == 8 and parts[-1].isdigit():
+            return f"{parts[-2]}_{parts[-1]}"
+
         return parts[-1]
 
     return None
