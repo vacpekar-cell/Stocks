@@ -13,6 +13,7 @@ import os
 import gc
 import time
 import warnings
+import re
 import threading
 import queue
 import matplotlib.pyplot as plt
@@ -221,14 +222,14 @@ def infer_horizon_from_filename(path: str) -> str | None:
 def infer_timestamp_from_model(path: str) -> str | None:
     base = os.path.basename(path)
     name = os.path.splitext(base)[0]
+
+    match = re.search(r"(\d{8}_\d{6})", name)
+    if match:
+        return match.group(1)
+
     parts = name.split("_")
-
-    if len(parts) >= 4 and parts[0] == "model" and parts[1] == "resnet":
-        # Typical pattern: model_resnet_<horizon>_YYYYMMDD_HHMMSS
-        if len(parts) >= 5 and parts[-2].isdigit() and len(parts[-2]) == 8 and parts[-1].isdigit():
-            return f"{parts[-2]}_{parts[-1]}"
-
-        return parts[-1]
+    if len(parts) >= 2 and parts[-2].isdigit() and len(parts[-2]) == 8 and parts[-1].isdigit():
+        return f"{parts[-2]}_{parts[-1]}"
 
     return None
 
@@ -415,6 +416,7 @@ class TrainingThread(threading.Thread):
             pretrained_models = self.params.get('pretrained_models', {})
 
             results = []
+            trained_models = []
 
             for task in target_tasks:
                 if self.stop_event.is_set():
@@ -432,12 +434,16 @@ class TrainingThread(threading.Thread):
                 else:
                     self.app.thread_safe_logger.log(f"\n--- Trénování nového horizontu {horizon} ---")
 
-                val_loss = self.train_single_model(
+                train_outcome = self.train_single_model(
                     network_id=horizon,
                     X_train=task['X_train'],
                     y_train=task['y_train'],
                     X_val=task['X_val'],
                     y_val=task['y_val'],
+                    meta_train_X=task['meta_train_X'],
+                    meta_val_X=task['meta_val_X'],
+                    meta_train_y=task['meta_train_y'],
+                    meta_val_y=task['meta_val_y'],
                     timestamp=timestamp,
                     batch_size=batch_size,
                     epochs=epochs,
@@ -465,7 +471,8 @@ class TrainingThread(threading.Thread):
                         'timestamp': timestamp,
                         'model_type': 'resnet',
                         'horizon': horizon,
-                        'val_loss': val_loss,
+                        'val_loss': train_outcome.get('val_loss', float('inf')),
+                        'meta_val_loss': train_outcome.get('meta_val_loss'),
                         'continued_training': continue_training,
                         'epochs': epochs,
                         'batch_size': batch_size,
@@ -480,6 +487,7 @@ class TrainingThread(threading.Thread):
                         'seed': seed,
                     }
                 )
+                trained_models.append(train_outcome)
 
             if not self.stop_event.is_set():
                 self.app.thread_safe_logger.log(f"\n=== Trénink dokončen (ID: {timestamp}) ===")
@@ -500,6 +508,34 @@ class TrainingThread(threading.Thread):
                 except Exception as e:
                     self.app.thread_safe_logger.log(f"Varování: Chyba při ukládání výsledků: {str(e)}")
 
+                try:
+                    bundle = {
+                        'bundle_type': 'training_bundle',
+                        'timestamp': timestamp,
+                        'use_sigmoid': use_sigmoid,
+                        'models': {},
+                    }
+
+                    for entry in trained_models:
+                        if not entry or not entry.get('horizon'):
+                            continue
+                        bundle['models'][entry['horizon']] = {
+                            'model_state': entry.get('model_state'),
+                            'meta_state': entry.get('meta_state'),
+                            'val_loss': entry.get('val_loss'),
+                            'meta_val_loss': entry.get('meta_val_loss'),
+                            'output_dim': entry.get('output_dim', 1),
+                            'input_dim': entry.get('input_dim'),
+                        }
+
+                    bundle_file = f"models_bundle_{timestamp}.pt"
+                    torch.save(bundle, bundle_file)
+                    self.app.thread_safe_logger.log(
+                        f"Modely a metasítě z běhu {timestamp} uloženy do '{bundle_file}'."
+                    )
+                except Exception as e:
+                    self.app.thread_safe_logger.log(f"Varování: Nepodařilo se uložit bundle modelů: {e}")
+
             self.app.root.after(0, self.app.enable_buttons)
             
         except Exception as e:
@@ -508,15 +544,15 @@ class TrainingThread(threading.Thread):
             self.app.thread_safe_logger.log(error_msg)
             self.app.root.after(0, self.app.enable_buttons)
     
-    def train_single_model(self, network_id, X_train, y_train, X_val, y_val, timestamp,
-                           batch_size, epochs, patience, device, use_mixed_precision=False,
-                           use_augmentation=False, noise_level=0.03, mixup_prob=0.2,
-                           learning_rate=0.001, weight_decay=0.0001, use_sigmoid=True,
+    def train_single_model(self, network_id, X_train, y_train, X_val, y_val, meta_train_X, meta_val_X,
+                           meta_train_y, meta_val_y, timestamp, batch_size, epochs, patience, device,
+                           use_mixed_precision=False, use_augmentation=False, noise_level=0.03,
+                           mixup_prob=0.2, learning_rate=0.001, weight_decay=0.0001, use_sigmoid=True,
                            dropout_rate=0.25, scheduler_type='cosine', min_lr='1e-6',
                            pretrained_model=None, output_dim=3):
         try:
             if self.stop_event.is_set():
-                return float('inf')
+                return {'horizon': network_id, 'val_loss': float('inf'), 'meta_val_loss': None}
                 
             gc.collect()
             if device.type == 'cuda':
@@ -608,6 +644,8 @@ class TrainingThread(threading.Thread):
             
             best_val_loss = float('inf')
             best_model_state = None
+            meta_state = None
+            meta_val_loss = None
             
             for epoch in range(epochs):
                 if self.stop_event.is_set():
@@ -725,23 +763,29 @@ class TrainingThread(threading.Thread):
             self.app.thread_safe_logger.log(f"Model uložen jako '{model_file}'")
 
             try:
-                meta_loss = self.train_meta_model(
-                    network_id,
-                    timestamp,
-                    model_state=best_model_state,
-                    X_train=X_train,
-                    y_train=y_train,
-                    X_val=X_val,
-                    y_val=y_val,
-                    batch_size=batch_size,
-                    device=device,
-                    use_mixed_precision=use_mixed_precision,
-                    dropout_rate=dropout_rate,
-                    use_sigmoid=use_sigmoid,
-                )
-                self.app.thread_safe_logger.log(
-                    f"Metasíť pro horizont {network_id} dokončena. Nejlepší validační ztráta: {meta_loss:.6f}"
-                )
+                if len(meta_train_X) == 0 or len(meta_val_X) == 0:
+                    self.app.thread_safe_logger.log(
+                        f"Metasíť pro horizont {network_id} přeskočena: k dispozici je méně než 10 % dat pro meta trénink."
+                    )
+                else:
+                    meta_val_loss, meta_state = self.train_meta_model(
+                        network_id,
+                        timestamp,
+                        model_state=best_model_state,
+                        X_train=meta_train_X,
+                        y_train=meta_train_y,
+                        X_val=meta_val_X,
+                        y_val=meta_val_y,
+                        batch_size=batch_size,
+                        device=device,
+                        use_mixed_precision=use_mixed_precision,
+                        dropout_rate=dropout_rate,
+                        use_sigmoid=use_sigmoid,
+                    )
+                    if meta_state is not None:
+                        self.app.thread_safe_logger.log(
+                            f"Metasíť pro horizont {network_id} dokončena. Nejlepší validační ztráta: {meta_val_loss:.6f}"
+                        )
             except Exception as exc:
                 self.app.thread_safe_logger.log(
                     f"Varování: trénink metasítě pro {network_id} selhal: {exc}"
@@ -758,13 +802,21 @@ class TrainingThread(threading.Thread):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
-            return best_val_loss
+            return {
+                'horizon': network_id,
+                'val_loss': best_val_loss,
+                'meta_val_loss': meta_val_loss,
+                'model_state': best_model_state,
+                'meta_state': meta_state,
+                'output_dim': output_dim,
+                'input_dim': X_train.shape[1],
+            }
 
         except Exception as e:
             import traceback
             error_msg = f"\nCHYBA při tréninku sítě {network_id}: {str(e)}\n{traceback.format_exc()}"
             self.app.thread_safe_logger.log(error_msg)
-            return float('inf')
+            return {'horizon': network_id, 'val_loss': float('inf'), 'meta_val_loss': None}
 
     def train_meta_model(
         self,
@@ -912,13 +964,14 @@ class TrainingThread(threading.Thread):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
-            return best_val_loss
+            final_state = best_state if best_state is not None else {k: v.cpu() for k, v in meta_model.state_dict().items()}
+            return best_val_loss, final_state
 
         except Exception as e:
             import traceback
             error_msg = f"CHYBA při tréninku metasítě {network_id}: {str(e)}\n{traceback.format_exc()}"
             self.app.thread_safe_logger.log(error_msg)
-            return float('inf')
+            return float('inf'), None
 
 # Main application
 class NeuralNetApp:
@@ -1207,6 +1260,19 @@ class NeuralNetApp:
     def load_validation_indices(self):
         indices_map = {}
 
+        def normalize_entry(entry):
+            if isinstance(entry, dict):
+                return {
+                    'val': np.array(entry.get('val', []), dtype=int),
+                    'meta_train': np.array(entry.get('meta_train', []), dtype=int),
+                    'meta_val': np.array(entry.get('meta_val', []), dtype=int),
+                }
+            return {
+                'val': np.array(entry, dtype=int),
+                'meta_train': np.array([], dtype=int),
+                'meta_val': np.array([], dtype=int),
+            }
+
         for model_path in self.loaded_models:
             timestamp = infer_timestamp_from_model(model_path)
             if not timestamp:
@@ -1221,7 +1287,7 @@ class NeuralNetApp:
                     data = pickle.load(f)
 
                 if isinstance(data, dict):
-                    indices_map = {k: np.array(v) for k, v in data.items()}
+                    indices_map = {k: normalize_entry(v) for k, v in data.items()}
                     self.output_text.insert(tk.END, f"Načteny validační indexy z '{candidate}'.\n")
                     break
             except Exception as e:
@@ -1367,9 +1433,10 @@ class NeuralNetApp:
 
                 column_mapping = map_columns_to_horizons(y_df.columns)
                 target_tasks = []
-                val_indices_to_save = {}
+                split_indices_to_save = {}
 
                 saved_val_indices = self.load_validation_indices() if continue_training else {}
+                meta_fraction = 0.1
 
                 for horizon in HORIZON_ORDER:
                     column = column_mapping.get(horizon)
@@ -1383,28 +1450,66 @@ class NeuralNetApp:
                     horizon_indices = np.nonzero(mask.values)[0]
                     y_values = series.values.reshape(-1, 1)
 
-                    preset_val_idx = saved_val_indices.get(horizon)
-                    if preset_val_idx is not None:
-                        preset_val_idx = [idx for idx in preset_val_idx if idx < len(X_scaled)]
-                        train_idx = [idx for idx in horizon_indices if idx not in preset_val_idx]
-                        val_idx = preset_val_idx
-                        if not val_idx:
-                            self.output_text.insert(tk.END, f"Varování: Žádné uložené validační indexy pro {horizon}, provádím nový split.\n")
-                            train_idx, val_idx = train_test_split(
-                                horizon_indices, test_size=val_split, random_state=seed
+                    saved_entry = saved_val_indices.get(horizon, {})
+                    saved_val_idx = [idx for idx in saved_entry.get('val', []) if idx < len(X_scaled)]
+                    saved_meta_train_idx = [idx for idx in saved_entry.get('meta_train', []) if idx < len(X_scaled)]
+                    saved_meta_val_idx = [idx for idx in saved_entry.get('meta_val', []) if idx < len(X_scaled)]
+
+                    # Meta holdout: 10% dedicated to metasít training only
+                    if saved_meta_train_idx or saved_meta_val_idx:
+                        meta_train_idx = saved_meta_train_idx
+                        meta_val_idx = saved_meta_val_idx
+                        base_pool = [idx for idx in horizon_indices if idx not in meta_train_idx and idx not in meta_val_idx]
+                        self.output_text.insert(tk.END, f"Používám uložené meta a validační indexy pro {horizon}.\n")
+                    else:
+                        if len(horizon_indices) >= 2:
+                            base_pool, meta_pool = train_test_split(
+                                horizon_indices, test_size=meta_fraction, random_state=seed
                             )
                         else:
+                            base_pool, meta_pool = horizon_indices, []
+
+                        if len(meta_pool) >= 2:
+                            meta_train_idx, meta_val_idx = train_test_split(
+                                meta_pool, test_size=val_split, random_state=seed
+                            )
+                        else:
+                            meta_train_idx, meta_val_idx = meta_pool, meta_pool
+
+                    # Validation split for primary model (disjoint from meta holdout)
+                    if saved_val_idx:
+                        val_idx = [idx for idx in saved_val_idx if idx in base_pool]
+                        if not val_idx:
+                            self.output_text.insert(tk.END, f"Varování: Uložené validační indexy pro {horizon} nejsou použitelné, provádím nový split.\n")
+                            train_idx, val_idx = train_test_split(
+                                base_pool, test_size=val_split, random_state=seed
+                            ) if len(base_pool) >= 2 else (base_pool, base_pool)
+                        else:
+                            train_idx = [idx for idx in base_pool if idx not in val_idx]
                             self.output_text.insert(tk.END, f"Používám uložené validační indexy pro {horizon}.\n")
                     else:
-                        train_idx, val_idx = train_test_split(
-                            horizon_indices, test_size=val_split, random_state=seed
-                        )
+                        if len(base_pool) >= 2:
+                            train_idx, val_idx = train_test_split(
+                                base_pool, test_size=val_split, random_state=seed
+                            )
+                        else:
+                            train_idx, val_idx = base_pool, base_pool
 
-                    val_indices_to_save[horizon] = np.array(val_idx)
+                    split_indices_to_save[horizon] = {
+                        'val': np.array(val_idx),
+                        'meta_train': np.array(meta_train_idx),
+                        'meta_val': np.array(meta_val_idx),
+                    }
+
                     X_train = X_scaled[train_idx]
                     X_val = X_scaled[val_idx]
                     y_train = y_values[train_idx]
                     y_val = y_values[val_idx]
+
+                    meta_train = X_scaled[meta_train_idx] if len(meta_train_idx) > 0 else np.empty((0, X_scaled.shape[1]))
+                    meta_val = X_scaled[meta_val_idx] if len(meta_val_idx) > 0 else np.empty((0, X_scaled.shape[1]))
+                    meta_train_targets = y_values[meta_train_idx] if len(meta_train_idx) > 0 else np.empty((0, 1))
+                    meta_val_targets = y_values[meta_val_idx] if len(meta_val_idx) > 0 else np.empty((0, 1))
 
                     target_tasks.append(
                         {
@@ -1413,6 +1518,10 @@ class NeuralNetApp:
                             'y_train': torch.FloatTensor(y_train),
                             'X_val': torch.FloatTensor(X_val),
                             'y_val': torch.FloatTensor(y_val),
+                            'meta_train_X': torch.FloatTensor(meta_train),
+                            'meta_val_X': torch.FloatTensor(meta_val),
+                            'meta_train_y': torch.FloatTensor(meta_train_targets),
+                            'meta_val_y': torch.FloatTensor(meta_val_targets),
                         }
                     )
 
@@ -1424,11 +1533,11 @@ class NeuralNetApp:
                     self.enable_buttons()
                     return
 
-                if val_indices_to_save:
+                if split_indices_to_save:
                     val_index_file = f"val_indices_{timestamp}.pkl"
                     with open(val_index_file, "wb") as f:
-                        pickle.dump(val_indices_to_save, f)
-                    self.output_text.insert(tk.END, f"Validační indexy uloženy do '{val_index_file}'.\n")
+                        pickle.dump(split_indices_to_save, f)
+                    self.output_text.insert(tk.END, f"Validační a meta indexy uloženy do '{val_index_file}'.\n")
 
                 self.output_text.insert(
                     tk.END,
@@ -1577,10 +1686,37 @@ class NeuralNetApp:
                     torch.cuda.synchronize()
 
                 horizon_models = {}
-                for path in models_to_use:
-                    horizon = infer_horizon_from_filename(path)
-                    if horizon:
-                        horizon_models[horizon] = path
+                meta_model_states = {}
+
+                def load_bundle(path: str):
+                    try:
+                        obj = torch.load(path, map_location='cpu')
+                    except Exception:
+                        return None
+                    if isinstance(obj, dict) and obj.get('bundle_type') == 'training_bundle':
+                        return obj
+                    return None
+
+                bundle_timestamp = None
+                effective_use_sigmoid = self.use_sigmoid.get()
+                bundle = None
+                if len(models_to_use) == 1:
+                    bundle = load_bundle(models_to_use[0])
+
+                if bundle:
+                    bundle_timestamp = bundle.get('timestamp') or infer_timestamp_from_model(models_to_use[0])
+                    effective_use_sigmoid = bundle.get('use_sigmoid', effective_use_sigmoid)
+                    for horizon, payload in bundle.get('models', {}).items():
+                        horizon_models[horizon] = payload.get('model_state') or payload
+                        if payload.get('meta_state') is not None:
+                            meta_model_states[horizon] = payload['meta_state']
+                    self.output_text.insert(tk.END, f"Načten bundle modelů s {len(horizon_models)} sítěmi.\n")
+                else:
+                    for path in models_to_use:
+                        horizon = infer_horizon_from_filename(path)
+                        if horizon:
+                            horizon_models[horizon] = path
+                    effective_use_sigmoid = self.use_sigmoid.get()
 
                 num_rows = X_predict_tensor.shape[0]
 
@@ -1589,8 +1725,8 @@ class NeuralNetApp:
                     "Dropout během predikce je vypnutý, používám deterministické výstupy a metasíť pro odhad chyby.\n",
                 )
 
-                def predict_with_model(model_path: str, output_dim: int) -> np.ndarray:
-                    state_dict = torch.load(model_path, map_location='cpu')
+                def predict_with_model(model_path, output_dim: int) -> np.ndarray:
+                    state_dict = torch.load(model_path, map_location='cpu') if isinstance(model_path, str) else model_path
                     inferred_dim = infer_output_dim_from_state_dict(state_dict)
                     if inferred_dim != output_dim:
                         output_dim = inferred_dim
@@ -1598,7 +1734,7 @@ class NeuralNetApp:
                     model = EfficientResNet(
                         X_predict_scaled.shape[1],
                         hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1]),
-                        use_sigmoid=self.use_sigmoid.get(),
+                        use_sigmoid=effective_use_sigmoid,
                         output_dim=output_dim
                     )
 
@@ -1623,13 +1759,13 @@ class NeuralNetApp:
                     stacked = torch.cat(pass_predictions)
                     return inverse_target_transform(stacked).cpu().numpy()
 
-                def find_meta_model_path(base_model_path: str, horizon: str | None):
-                    timestamp = infer_timestamp_from_model(base_model_path)
+                def find_meta_model_path(base_model_path, horizon: str | None, timestamp_hint: str | None = None):
+                    timestamp = infer_timestamp_from_model(base_model_path) if isinstance(base_model_path, str) else timestamp_hint
                     if horizon is None or timestamp is None:
                         return None
 
                     candidate = f"meta_resnet_{horizon}_{timestamp}.pt"
-                    base_dir = os.path.dirname(base_model_path) or "."
+                    base_dir = (os.path.dirname(base_model_path) or ".") if isinstance(base_model_path, str) else "."
                     full_candidate = os.path.join(base_dir, candidate)
 
                     if os.path.exists(full_candidate):
@@ -1638,8 +1774,8 @@ class NeuralNetApp:
                         return candidate
                     return None
 
-                def predict_meta_errors(meta_model_path: str, base_predictions: np.ndarray) -> np.ndarray:
-                    state_dict = torch.load(meta_model_path, map_location='cpu')
+                def predict_meta_errors(meta_model_path, base_predictions: np.ndarray) -> np.ndarray:
+                    state_dict = torch.load(meta_model_path, map_location='cpu') if isinstance(meta_model_path, str) else meta_model_path
                     meta_model = ErrorEstimator(
                         X_predict_scaled.shape[1] + 1,
                         hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1] + 1),
@@ -1681,8 +1817,11 @@ class NeuralNetApp:
                         mean_preds = predict_with_model(horizon_models[horizon], 1).reshape(-1)
                         results[f"mean_{horizon}"] = mean_preds
 
-                        meta_model_path = find_meta_model_path(horizon_models[horizon], horizon)
-                        if meta_model_path:
+                        meta_state = meta_model_states.get(horizon)
+                        meta_model_path = find_meta_model_path(horizon_models[horizon], horizon, bundle_timestamp) if meta_state is None else None
+                        if meta_state is not None:
+                            results[f"error_{horizon}"] = predict_meta_errors(meta_state, mean_preds)
+                        elif meta_model_path:
                             results[f"error_{horizon}"] = predict_meta_errors(meta_model_path, mean_preds)
                         else:
                             self.output_text.insert(
@@ -1703,8 +1842,11 @@ class NeuralNetApp:
                         horizon_preds = mean_preds[:, j]
                         results[f"mean_{horizon}"] = horizon_preds
 
-                        base_meta_path = find_meta_model_path(fallback_model, horizon)
-                        if base_meta_path:
+                        meta_state = meta_model_states.get(horizon)
+                        base_meta_path = find_meta_model_path(fallback_model, horizon, bundle_timestamp) if meta_state is None else None
+                        if meta_state is not None:
+                            results[f"error_{horizon}"] = predict_meta_errors(meta_state, horizon_preds)
+                        elif base_meta_path:
                             results[f"error_{horizon}"] = predict_meta_errors(base_meta_path, horizon_preds)
                         else:
                             self.output_text.insert(
