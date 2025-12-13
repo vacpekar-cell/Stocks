@@ -252,7 +252,7 @@ class PortfolioApp:
         self.cap_var = tk.DoubleVar(value=0.25)
         ttk.Entry(control_frame, textvariable=self.cap_var, width=8).pack(side=tk.LEFT)
 
-        ttk.Button(control_frame, text="Postavit portfolio", command=self.start_build).pack(side=tk.RIGHT)
+        ttk.Button(control_frame, text="Sestavit portfolio", command=self.start_build).pack(side=tk.RIGHT)
 
         self.tree = ttk.Treeview(main, columns=("ticker", "sharpe", "forecast", "std"), show="headings", height=8)
         for col, text in zip(self.tree["columns"], ["Ticker", "Sharpe", "Forecast %", "Std %"]):
@@ -295,9 +295,10 @@ class PortfolioApp:
 
     @staticmethod
     def _to_float(value) -> float:
-        # Podpora čárky jako desetinné tečky i běžného zápisu
+        """Robustně převede hodnotu na float včetně zápisů s procenty."""
+
         if isinstance(value, str):
-            value = value.replace(",", ".").strip()
+            value = value.replace("%", "").replace(",", ".").strip()
         return float(value)
 
     def load_csv(self):
@@ -320,7 +321,10 @@ class PortfolioApp:
                     forecast_pct=self._to_float(row.iloc[2]),
                     std_pct=self._to_float(row.iloc[3]),
                 )
-                self.records.append(rec)
+                if rec.ticker:
+                    self.records.append(rec)
+                else:
+                    raise ValueError("ticker je prázdný")
             except Exception:
                 self.log(f"Přeskakuji řádek: {row}")
 
