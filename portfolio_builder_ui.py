@@ -148,11 +148,17 @@ def build_correlation_matrix(tickers: list[str], cache: ReturnCache, log_fn) -> 
     if not tickers:
         return np.zeros((0, 0))
 
-    returns = {}
+    series_map: dict[str, pd.Series] = {}
     for ticker in tickers:
-        returns[ticker] = cache.get_returns(ticker, log_fn)
+        series = cache.get_returns(ticker, log_fn)
+        if not isinstance(series, pd.Series):
+            series = pd.Series(series)
+        series_map[ticker] = series
 
-    aligned = pd.DataFrame(returns).dropna(how="all")
+    # pd.concat is more forgiving when some entries are scalars/empty; if still empty, fall back to zeros
+    aligned = pd.concat(series_map, axis=1).dropna(how="all") if series_map else pd.DataFrame()
+    if not aligned.empty:
+        aligned.columns = tickers
     if aligned.empty:
         log_fn("Není dostatek dat pro korelace, použiji nulovou korelaci.")
         return np.zeros((len(tickers), len(tickers)))
