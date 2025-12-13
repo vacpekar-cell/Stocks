@@ -50,48 +50,52 @@ def _safe_covariance_matrix(stds: np.ndarray, corr: np.ndarray) -> np.ndarray:
 
 
 def _rebalance_with_caps(raw_weights: np.ndarray, max_weight: float) -> np.ndarray:
-    """Normalize weights, apply caps, and redistribute remainders."""
+    """Project weights onto the simplex with an upper bound per asset."""
 
     weights = np.clip(raw_weights, 0.0, None)
+    n = len(weights)
+    if n == 0:
+        return weights
+
     if weights.sum() == 0:
         weights = np.ones_like(weights)
     weights = weights / weights.sum()
 
-    cap = max(0.0, min(float(max_weight), 1.0))
-    if cap == 0.0:
-        # Fall back to equal weights if cap is zero
-        return np.ones_like(weights) / len(weights)
+    # Allow users to input either 0.25 or 25 for a 25 % cap
+    cap = float(max_weight)
+    if cap > 1.0:
+        cap = cap / 100.0
+    cap = max(0.0, min(cap, 1.0))
 
-    # Iteratively clamp overweight names and renormalize the remainder
-    iteration_guard = 0
-    while True:
-        iteration_guard += 1
-        if iteration_guard > 50:
-            break
+    # If the requested cap makes the constraint infeasible, raise it to 1/n
+    if cap * n < 1.0:
+        cap = 1.0 / n
 
-        overweight = weights > cap + 1e-12
+    active = np.ones(n, dtype=bool)
+
+    # Successively cap overweight positions and redistribute the leftover mass
+    for _ in range(100):
+        overweight = active & (weights > cap + 1e-12)
         if not overweight.any():
             break
 
-        # Set overweight weights to the cap
         weights[overweight] = cap
+        active &= ~overweight
 
-        remaining = ~overweight
-        remaining_mass = weights[remaining].sum()
-        free_mass = 1.0 - cap * overweight.sum()
+        remaining_mass = weights[active].sum()
+        free_mass = 1.0 - weights.sum()
 
-        if not remaining.any():
-            # Everyone is capped; spread evenly
-            weights[:] = 1.0 / len(weights)
+        if not active.any():
             break
 
         if remaining_mass <= 0:
-            weights[remaining] = free_mass / remaining.sum()
+            weights[active] = free_mass / active.sum()
         else:
-            # Scale the remaining portion to consume the available mass
-            weights[remaining] = weights[remaining] / remaining_mass * free_mass
+            weights[active] = weights[active] / remaining_mass * free_mass
 
-    weights = np.clip(weights, 0.0, None)
+    weights = np.clip(weights, 0.0, cap)
+    if weights.sum() == 0:
+        weights = np.ones_like(weights) / n
     return weights / weights.sum()
 
 
@@ -240,6 +244,12 @@ class PortfolioBuilder:
                 stds = np.array([r.std_pct for r in trial_list])
 
                 weights = optimize_weights(expected, corr_matrix, stds, self.max_weight)
+                # Skip candidates that end up with ~0 váhu po optimalizaci
+                if weights[-1] < 1e-4:
+                    self.log(
+                        f"   Přeskakuji {candidate.ticker}, optimální váha {weights[-1]:.4f} je příliš nízká."
+                    )
+                    continue
                 sharpe = portfolio_sharpe(weights, expected, corr_matrix, stds)
 
                 self.log(
