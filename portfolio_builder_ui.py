@@ -57,36 +57,42 @@ def _rebalance_with_caps(raw_weights: np.ndarray, max_weight: float) -> np.ndarr
         weights = np.ones_like(weights)
     weights = weights / weights.sum()
 
-    # Iteratively cap overweight positions and redistribute to others
+    cap = max(0.0, min(float(max_weight), 1.0))
+    if cap == 0.0:
+        # Fall back to equal weights if cap is zero
+        return np.ones_like(weights) / len(weights)
+
+    # Iteratively clamp overweight names and renormalize the remainder
     iteration_guard = 0
     while True:
         iteration_guard += 1
-        if iteration_guard > 25:
+        if iteration_guard > 50:
             break
 
-        overweight = weights > max_weight
+        overweight = weights > cap + 1e-12
         if not overweight.any():
             break
 
-        excess = weights[overweight] - max_weight
-        weights[overweight] = max_weight
+        # Set overweight weights to the cap
+        weights[overweight] = cap
 
         remaining = ~overweight
-        remaining_sum = weights[remaining].sum()
-        # Distribute excess proportionally to remaining weights; if none, spread evenly
-        if remaining.any():
-            if remaining_sum == 0:
-                weights[remaining] = excess.sum() / remaining.sum()
-            else:
-                weights[remaining] += weights[remaining] / remaining_sum * excess.sum()
-        else:
-            # All are capped; break to avoid division by zero
+        remaining_mass = weights[remaining].sum()
+        free_mass = 1.0 - cap * overweight.sum()
+
+        if not remaining.any():
+            # Everyone is capped; spread evenly
+            weights[:] = 1.0 / len(weights)
             break
 
-        # Re-normalize to 1 after redistribution
-        weights = weights / weights.sum()
+        if remaining_mass <= 0:
+            weights[remaining] = free_mass / remaining.sum()
+        else:
+            # Scale the remaining portion to consume the available mass
+            weights[remaining] = weights[remaining] / remaining_mass * free_mass
 
-    return weights
+    weights = np.clip(weights, 0.0, None)
+    return weights / weights.sum()
 
 
 def optimize_weights(expected_returns: np.ndarray, corr_matrix: np.ndarray, stds: np.ndarray, max_weight: float) -> np.ndarray:
@@ -218,7 +224,7 @@ class PortfolioBuilder:
 
         while len(portfolio) < min(self.max_positions, len(self.records)):
             remaining = [r for r in self.records if r.ticker not in {p.ticker for p in portfolio}]
-            candidates = remaining[:10]
+            candidates = remaining[:50]
             if not candidates:
                 break
 
@@ -258,6 +264,15 @@ class PortfolioBuilder:
             weights = optimize_weights(expected, corr_matrix, stds, self.max_weight)
             for t, w in zip([r.ticker for r in portfolio], weights):
                 self.log(f"   Váha {t}: {w:.2%}")
+
+        # Final weights for the finished portfolio (avoid nulové váhy)
+        if portfolio:
+            final_corr = build_correlation_matrix([r.ticker for r in portfolio], self.cache, self.log)
+            expected = np.array([r.forecast_pct for r in portfolio])
+            stds = np.array([r.std_pct for r in portfolio])
+            final_weights = optimize_weights(expected, final_corr, stds, self.max_weight)
+            for t, w in zip([r.ticker for r in portfolio], final_weights):
+                self.log(f"Konečná váha {t}: {w:.2%}")
 
         return portfolio
 
