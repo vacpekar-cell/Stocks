@@ -288,26 +288,84 @@ class PortfolioBuilder:
 
         # Final weights for the finished portfolio (avoid nulové váhy)
         if portfolio:
-            final_corr = build_correlation_matrix([r.ticker for r in portfolio], self.cache, self.log)
+            greedy_corr = build_correlation_matrix([r.ticker for r in portfolio], self.cache, self.log)
             expected = np.array([r.forecast_pct for r in portfolio])
             stds = np.array([r.std_pct for r in portfolio])
-            final_weights = optimize_weights(expected, final_corr, stds, self.max_weight)
-            tickers_with_weights = list(zip([r.ticker for r in portfolio], final_weights))
+            greedy_weights = optimize_weights(expected, greedy_corr, stds, self.max_weight)
+            tickers_with_weights = list(zip([r.ticker for r in portfolio], greedy_weights))
             filtered = [(t, w) for t, w in tickers_with_weights if w >= 1e-4]
             if len(filtered) < len(tickers_with_weights):
                 removed = {t for t, _ in tickers_with_weights} - {t for t, _ in filtered}
                 for t in removed:
                     self.log(f"Konečná váha {t}: 0.00% (vyřazeno pro zanedbatelnou váhu)")
                 portfolio = [r for r in portfolio if r.ticker in {t for t, _ in filtered}]
-                final_corr = build_correlation_matrix([r.ticker for r in portfolio], self.cache, self.log)
+                greedy_corr = build_correlation_matrix([r.ticker for r in portfolio], self.cache, self.log)
                 expected = np.array([r.forecast_pct for r in portfolio])
                 stds = np.array([r.std_pct for r in portfolio])
-                final_weights = optimize_weights(expected, final_corr, stds, self.max_weight)
+                greedy_weights = optimize_weights(expected, greedy_corr, stds, self.max_weight)
+
+            greedy_sharpe = portfolio_sharpe(greedy_weights, expected, greedy_corr, stds)
+            self.log(f"Greedy Sharpe finálního portfolia: {greedy_sharpe:.3f}")
+
+            refined_portfolio, refined_weights, refined_sharpe = self._refine_final_portfolio()
+            if refined_sharpe > greedy_sharpe + 1e-6:
+                self.log(
+                    f"Refinement zlepšil Sharpe na {refined_sharpe:.3f}; aktualizuji portfolia a váhy."
+                )
+                portfolio = refined_portfolio
+                final_weights = refined_weights
+            else:
+                final_weights = greedy_weights
 
             for t, w in zip([r.ticker for r in portfolio], final_weights):
                 self.log(f"Konečná váha {t}: {w:.2%}")
 
         return portfolio
+
+    def _refine_final_portfolio(self) -> tuple[list[StockRecord], np.ndarray, float]:
+        """Global re-optimization from širší množiny tickerů.
+
+        Vezmeme širší koš (až 5× více tickerů než cílových pozic, max. 100),
+        spočítáme optimální váhy a iterativně odřezáváme tituly s nejnižšími
+        vahami, dokud nezůstaneme u požadovaného počtu pozic. Tím se eliminuje
+        vliv dřívějších greedy kroků a uvolněný cap (např. 25 %) má šanci
+        najít přinejmenším stejně dobré řešení jako přísnější cap.
+        """
+
+        if not self.records:
+            return [], np.array([]), 0.0
+
+        pool_size = min(len(self.records), max(1, min(self.max_positions * 5, 100)))
+        candidate_pool = self.records[:pool_size]
+
+        # Start with full pool
+        current = candidate_pool.copy()
+        while len(current) > self.max_positions:
+            tickers = [r.ticker for r in current]
+            corr = build_correlation_matrix(tickers, self.cache, self.log)
+            expected = np.array([r.forecast_pct for r in current])
+            stds = np.array([r.std_pct for r in current])
+            weights = optimize_weights(expected, corr, stds, self.max_weight)
+
+            # Drop the smallest weight to satisfy the position limit
+            drop_idx = int(np.argmin(weights))
+            if weights[drop_idx] <= 1e-8:
+                # If weights collapse to zeros, bail out
+                break
+            self.log(
+                f"Refinement: odebírám {current[drop_idx].ticker} (váha {weights[drop_idx]:.4%}) z širšího koše."
+            )
+            current.pop(drop_idx)
+
+        # Final optimization on the remaining set
+        tickers = [r.ticker for r in current]
+        corr = build_correlation_matrix(tickers, self.cache, self.log)
+        expected = np.array([r.forecast_pct for r in current])
+        stds = np.array([r.std_pct for r in current])
+        final_weights = optimize_weights(expected, corr, stds, self.max_weight)
+        final_sharpe = portfolio_sharpe(final_weights, expected, corr, stds)
+
+        return current, final_weights, final_sharpe
 
 
 # ---- UI ------------------------------------------------------------------
