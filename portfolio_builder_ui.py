@@ -50,16 +50,15 @@ def _safe_covariance_matrix(stds: np.ndarray, corr: np.ndarray) -> np.ndarray:
 
 
 def _rebalance_with_caps(raw_weights: np.ndarray, max_weight: float) -> np.ndarray:
-    """Project weights onto the simplex with an upper bound per asset."""
+    """Project weights onto the capped simplex (sum=1, 0<=w<=cap)."""
 
-    weights = np.clip(raw_weights, 0.0, None)
+    weights = np.clip(np.asarray(raw_weights, dtype=float), 0.0, None)
     n = len(weights)
     if n == 0:
         return weights
 
     if weights.sum() == 0:
         weights = np.ones_like(weights)
-    weights = weights / weights.sum()
 
     # Allow users to input either 0.25 or 25 for a 25 % cap
     cap = float(max_weight)
@@ -67,36 +66,34 @@ def _rebalance_with_caps(raw_weights: np.ndarray, max_weight: float) -> np.ndarr
         cap = cap / 100.0
     cap = max(0.0, min(cap, 1.0))
 
-    # If the requested cap makes the constraint infeasible, raise it to 1/n
+    # If the requested cap makes the constraint infeasible, lift it just enough
     if cap * n < 1.0:
         cap = 1.0 / n
 
-    active = np.ones(n, dtype=bool)
+    # Binary search for theta such that sum(min(max(w - theta, 0), cap)) == 1
+    v = weights
+    low = v.min() - cap
+    high = v.max()
 
-    # Successively cap overweight positions and redistribute the leftover mass
+    def project(theta: float) -> np.ndarray:
+        return np.clip(v - theta, 0.0, cap)
+
     for _ in range(100):
-        overweight = active & (weights > cap + 1e-12)
-        if not overweight.any():
+        mid = (low + high) / 2.0
+        proj = project(mid)
+        s = proj.sum()
+        if abs(s - 1.0) < 1e-10:
+            weights = proj
             break
-
-        weights[overweight] = cap
-        active &= ~overweight
-
-        remaining_mass = weights[active].sum()
-        free_mass = 1.0 - weights.sum()
-
-        if not active.any():
-            break
-
-        if remaining_mass <= 0:
-            weights[active] = free_mass / active.sum()
+        if s > 1.0:
+            low = mid
         else:
-            weights[active] = weights[active] / remaining_mass * free_mass
+            high = mid
+        weights = proj
 
-    weights = np.clip(weights, 0.0, cap)
     if weights.sum() == 0:
         weights = np.ones_like(weights) / n
-    return weights / weights.sum()
+    return weights
 
 
 def optimize_weights(expected_returns: np.ndarray, corr_matrix: np.ndarray, stds: np.ndarray, max_weight: float) -> np.ndarray:
@@ -270,8 +267,22 @@ class PortfolioBuilder:
                 f"{len(portfolio)}) Přidávám {chosen.ticker}, Sharpe portfolia nyní {best_sharpe:.3f}."
             )
 
-            # Recompute weights for the current portfolio to report them
+            # Recompute weights for the current portfolio, drop nulové váhy
             weights = optimize_weights(expected, corr_matrix, stds, self.max_weight)
+            tickers_with_weights = list(zip([r.ticker for r in portfolio], weights))
+            filtered = [(t, w) for t, w in tickers_with_weights if w >= 1e-4]
+            if len(filtered) < len(tickers_with_weights):
+                removed = {t for t, _ in tickers_with_weights} - {t for t, _ in filtered}
+                for t in removed:
+                    self.log(f"   Odstraňuji {t}, váha po optimalizaci je zanedbatelná.")
+                portfolio = [r for r in portfolio if r.ticker in {t for t, _ in filtered}]
+                weights = optimize_weights(
+                    np.array([r.forecast_pct for r in portfolio]),
+                    build_correlation_matrix([r.ticker for r in portfolio], self.cache, self.log),
+                    np.array([r.std_pct for r in portfolio]),
+                    self.max_weight,
+                )
+
             for t, w in zip([r.ticker for r in portfolio], weights):
                 self.log(f"   Váha {t}: {w:.2%}")
 
@@ -281,6 +292,18 @@ class PortfolioBuilder:
             expected = np.array([r.forecast_pct for r in portfolio])
             stds = np.array([r.std_pct for r in portfolio])
             final_weights = optimize_weights(expected, final_corr, stds, self.max_weight)
+            tickers_with_weights = list(zip([r.ticker for r in portfolio], final_weights))
+            filtered = [(t, w) for t, w in tickers_with_weights if w >= 1e-4]
+            if len(filtered) < len(tickers_with_weights):
+                removed = {t for t, _ in tickers_with_weights} - {t for t, _ in filtered}
+                for t in removed:
+                    self.log(f"Konečná váha {t}: 0.00% (vyřazeno pro zanedbatelnou váhu)")
+                portfolio = [r for r in portfolio if r.ticker in {t for t, _ in filtered}]
+                final_corr = build_correlation_matrix([r.ticker for r in portfolio], self.cache, self.log)
+                expected = np.array([r.forecast_pct for r in portfolio])
+                stds = np.array([r.std_pct for r in portfolio])
+                final_weights = optimize_weights(expected, final_corr, stds, self.max_weight)
+
             for t, w in zip([r.ticker for r in portfolio], final_weights):
                 self.log(f"Konečná váha {t}: {w:.2%}")
 
