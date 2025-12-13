@@ -269,20 +269,46 @@ class PortfolioApp:
         self.log_box.see(tk.END)
         self.log_box.configure(state=tk.DISABLED)
 
+    def _read_stock_table(self, path: str) -> pd.DataFrame:
+        """Robustně načte tabulku bez ohledu na hlavičky či oddělovač."""
+
+        # Nejprve se pokusíme autodetekovat oddělovač a nečekat hlavičku
+        try:
+            df = pd.read_csv(path, sep=None, engine="python", header=None, comment="#")
+        except Exception as exc:
+            raise RuntimeError(f"Nelze načíst soubor: {exc}")
+
+        # Pokud je podezření na hlavičku a zároveň málo sloupců, zkusíme ještě variantu s hlavičkou
+        if df.shape[1] < 4:
+            try:
+                df_with_header = pd.read_csv(path, sep=None, engine="python", comment="#")
+            except Exception:
+                df_with_header = pd.DataFrame()
+
+            if df_with_header.shape[1] >= 4:
+                df = df_with_header
+
+        if df.shape[1] < 4:
+            raise ValueError("Soubor musí mít alespoň 4 sloupce: ticker, sharpe, forecast %, std %.")
+
+        return df
+
+    @staticmethod
+    def _to_float(value) -> float:
+        # Podpora čárky jako desetinné tečky i běžného zápisu
+        if isinstance(value, str):
+            value = value.replace(",", ".").strip()
+        return float(value)
+
     def load_csv(self):
-        path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(filetypes=[("CSV / CLS", "*.csv *.cls"), ("All files", "*.*")])
         if not path:
             return
 
         try:
-            df = pd.read_csv(path)
+            df = self._read_stock_table(path)
         except Exception as exc:
-            messagebox.showerror("Chyba", f"Nelze načíst CSV: {exc}")
-            return
-
-        expected_cols = [0, 1, 2, 3]
-        if any(col >= len(df.columns) for col in expected_cols):
-            messagebox.showerror("Chyba", "CSV musí mít alespoň 4 sloupce: ticker, sharpe, forecast %, std %.")
+            messagebox.showerror("Chyba", str(exc))
             return
 
         self.records = []
@@ -290,9 +316,9 @@ class PortfolioApp:
             try:
                 rec = StockRecord(
                     ticker=str(row.iloc[0]).strip(),
-                    sharpe=float(row.iloc[1]),
-                    forecast_pct=float(row.iloc[2]),
-                    std_pct=float(row.iloc[3]),
+                    sharpe=self._to_float(row.iloc[1]),
+                    forecast_pct=self._to_float(row.iloc[2]),
+                    std_pct=self._to_float(row.iloc[3]),
                 )
                 self.records.append(rec)
             except Exception:
@@ -302,7 +328,9 @@ class PortfolioApp:
         for rec in self.records:
             self.tree.insert("", tk.END, values=(rec.ticker, f"{rec.sharpe:.3f}", f"{rec.forecast_pct:.3f}", f"{rec.std_pct:.3f}"))
 
-        self.log(f"Načteno {len(self.records)} záznamů z {os.path.basename(path)}")
+        self.log(
+            f"Načteno {len(self.records)} záznamů z {os.path.basename(path)}. Hlavička není nutná; očekávám pořadí: ticker, sharpe, forecast %, std %."
+        )
 
     def start_build(self):
         if not self.records:
