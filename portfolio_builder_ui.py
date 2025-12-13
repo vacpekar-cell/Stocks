@@ -402,13 +402,96 @@ class PortfolioBuilder:
                 best_weights = pg_weights
                 best_sharpe = pg_sharpe
 
-            final_weights = best_weights
-            portfolio = best_portfolio
+            # Drop nulové/zanedbatelné váhy po finální optimalizaci a případně ještě jednou zkus optimalizovat
+            portfolio, final_weights, final_sharpe = self._prune_and_polish_final(
+                best_portfolio, best_weights, best_sharpe
+            )
 
+            self.log(f"Konečný Sharpe po vyčištění: {final_sharpe:.3f}")
             for t, w in zip([r.ticker for r in portfolio], final_weights):
                 self.log(f"Konečná váha {t}: {w:.2%}")
 
         return portfolio
+
+    def _prune_and_polish_final(
+        self, portfolio: list[StockRecord], weights: np.ndarray, sharpe: float
+    ) -> tuple[list[StockRecord], np.ndarray, float]:
+        """Remove near-zero allocations and re-optimize the remaining set.
+
+        This prevents závěrečné portfolio from obsahující pozice s váhou ~0 a dává
+        optimalizátoru ještě jednu šanci tyto prostředky přerozdělit.
+        """
+
+        tol = 1e-4
+        current_portfolio = portfolio
+        current_weights = np.array(weights, dtype=float)
+        current_sharpe = float(sharpe)
+
+        changed = True
+        while changed and len(current_portfolio) > 0:
+            changed = False
+            mask = current_weights > tol
+            if mask.all():
+                break
+
+            removed = [r.ticker for r, keep in zip(current_portfolio, mask) if not keep]
+            for ticker in removed:
+                self.log(f"   Odstraňuji {ticker}, váha po optimalizaci je zanedbatelná.")
+
+            current_portfolio = [r for r, keep in zip(current_portfolio, mask) if keep]
+            current_weights = current_weights[mask]
+            if len(current_portfolio) == 0:
+                return [], np.array([]), 0.0
+
+            # Rebalance removed weight back onto the capped simplex
+            current_weights = _rebalance_with_caps(current_weights, self.max_weight)
+            changed = True
+
+        if not current_portfolio:
+            return [], np.array([]), 0.0
+
+        tickers = [r.ticker for r in current_portfolio]
+        corr = build_correlation_matrix(tickers, self.cache, self.log)
+        expected = np.array([r.forecast_pct for r in current_portfolio])
+        stds = np.array([r.std_pct for r in current_portfolio])
+
+        # Seed the gradient polish with the cleaned weights and a fresh closed-form start
+        seed_weights = [current_weights]
+        closed_form = optimize_weights(expected, corr, stds, self.max_weight)
+        seed_weights.append(closed_form)
+
+        pg_weights, pg_sharpe = _projected_gradient_sharpe(
+            expected, corr, stds, self.max_weight, seeds=seed_weights
+        )
+
+        best_weights = current_weights
+        best_sharpe = current_sharpe
+
+        if pg_sharpe > best_sharpe + 1e-6:
+            self.log(
+                f"   Dodatečný gradient zvýšil Sharpe na {pg_sharpe:.3f} po odstranění nulových vah."
+            )
+            best_weights = pg_weights
+            best_sharpe = pg_sharpe
+
+        # Final pass to drop any residual ~0 váhy a renormalizovat
+        mask = best_weights > tol
+        if not mask.all():
+            removed = [t for t, keep in zip(tickers, mask) if not keep]
+            for ticker in removed:
+                self.log(f"   Odstraňuji {ticker}, váha po polish je zanedbatelná.")
+            current_portfolio = [r for r, keep in zip(current_portfolio, mask) if keep]
+            best_weights = best_weights[mask]
+            if len(current_portfolio) == 0:
+                return [], np.array([]), 0.0
+            tickers = [r.ticker for r in current_portfolio]
+            corr = build_correlation_matrix(tickers, self.cache, self.log)
+            expected = np.array([r.forecast_pct for r in current_portfolio])
+            stds = np.array([r.std_pct for r in current_portfolio])
+            best_weights = _rebalance_with_caps(best_weights, self.max_weight)
+            best_sharpe = portfolio_sharpe(best_weights, expected, corr, stds)
+
+        return current_portfolio, best_weights, best_sharpe
 
     def _refine_final_portfolio(self) -> tuple[list[StockRecord], np.ndarray, float]:
         """Global re-optimization from širší množiny tickerů.
