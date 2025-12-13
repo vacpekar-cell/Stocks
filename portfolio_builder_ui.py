@@ -331,11 +331,26 @@ class PortfolioApp:
 
     @staticmethod
     def _to_float(value) -> float:
-        """Robustně převede hodnotu na float včetně zápisů s procenty."""
+        """Robustně převede hodnotu na float včetně zápisů s procenty.
 
+        Pokud vstup obsahuje znak `%`, vrátí hodnotu již převedenou na desetinný
+        tvar (tj. `3.5%` -> `0.035`). To umožní korektně porovnávat Sharpeho
+        poměr, kde očekávaný výnos i směrodatná odchylka musí být ve stejném
+        měřítku.
+        """
+
+        percent = False
         if isinstance(value, str):
+            percent = "%" in value
             value = value.replace("%", "").replace(",", ".").strip()
-        return float(value)
+
+        number = float(value)
+        # Pokud je hodnota ve formátu procent (obsahuje "%"), nebo je výrazně
+        # větší než 1 (typicky 3.5 pro "3.5 %"), považujeme ji za procenta a
+        # převedeme na desetinný tvar.
+        if percent or abs(number) > 1.0:
+            number /= 100.0
+        return number
 
     def load_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV / CLS", "*.csv *.cls"), ("All files", "*.*")])
