@@ -407,6 +407,12 @@ class PortfolioBuilder:
                 best_portfolio, best_weights, best_sharpe
             )
 
+            # Pokud máme méně pozic než požadavek, zkusíme portfolio znovu rozšířit
+            if len(portfolio) < self.max_positions:
+                portfolio, final_weights, final_sharpe = self._expand_portfolio(
+                    portfolio, final_weights, final_sharpe
+                )
+
             self.log(f"Konečný Sharpe po vyčištění: {final_sharpe:.3f}")
             for t, w in zip([r.ticker for r in portfolio], final_weights):
                 self.log(f"Konečná váha {t}: {w:.2%}")
@@ -492,6 +498,76 @@ class PortfolioBuilder:
             best_sharpe = portfolio_sharpe(best_weights, expected, corr, stds)
 
         return current_portfolio, best_weights, best_sharpe
+
+    def _expand_portfolio(
+        self, portfolio: list[StockRecord], weights: np.ndarray, sharpe: float
+    ) -> tuple[list[StockRecord], np.ndarray, float]:
+        """Zkus přidat další tickery, pokud jich je méně než cílový počet.
+
+        - Vezme nejlepší dosud nepoužité tickery a spustí gradientní optimalizaci
+          na rozšířeném koši.
+        - Poté ponechá maximálně `max_positions` pozic s nejvyšší vahou a znovu
+          je renormalizuje na omezený simplex.
+        - Nové řešení přijme pouze tehdy, pokud Sharpe neklesne (s tolerancí
+          1e-6) oproti vstupu. Tím se udrží kvalita portfolia, ale pokud existuje
+          řešení se stejným či vyšším Sharpe a vyšším počtem pozic, použije se.
+        """
+
+        if len(portfolio) >= self.max_positions:
+            return portfolio, weights, sharpe
+
+        unused = [r for r in self.records if r.ticker not in {p.ticker for p in portfolio}]
+        if not unused:
+            return portfolio, weights, sharpe
+
+        slots_to_fill = self.max_positions - len(portfolio)
+        # Zvažme více kandidátů než je potřeba, aby optimalizace měla prostor
+        extra = unused[: max(slots_to_fill * 2, slots_to_fill)]
+        expanded = portfolio + extra
+
+        tickers = [r.ticker for r in expanded]
+        corr = build_correlation_matrix(tickers, self.cache, self.log)
+        expected = np.array([r.forecast_pct for r in expanded])
+        stds = np.array([r.std_pct for r in expanded])
+
+        # Seed: původní váhy rozšířené o malou hodnotu pro nové tituly
+        padded = np.zeros(len(expanded))
+        padded[: len(weights)] = weights
+        if padded.sum() <= 0:
+            padded[: len(portfolio)] = 1.0 / len(portfolio)
+        remaining = max(0.0, 1.0 - padded.sum())
+        if remaining > 0 and len(expanded) > len(weights):
+            padded[len(weights) :] = remaining / (len(expanded) - len(weights))
+
+        seeds = [padded]
+
+        pg_weights, pg_sharpe = _projected_gradient_sharpe(
+            expected, corr, stds, self.max_weight, seeds=seeds
+        )
+
+        # Ponecháme nejvyšší váhy do cílového počtu, zbytek zahodíme
+        top_indices = np.argsort(pg_weights)[::-1][: self.max_positions]
+        mask = np.zeros_like(pg_weights, dtype=bool)
+        mask[top_indices] = True
+
+        filtered_portfolio = [r for r, keep in zip(expanded, mask) if keep]
+        filtered_weights = pg_weights[mask]
+
+        filtered_weights = _rebalance_with_caps(filtered_weights, self.max_weight)
+        filtered_sharpe = portfolio_sharpe(
+            filtered_weights,
+            np.array([r.forecast_pct for r in filtered_portfolio]),
+            build_correlation_matrix([r.ticker for r in filtered_portfolio], self.cache, self.log),
+            np.array([r.std_pct for r in filtered_portfolio]),
+        )
+
+        if filtered_sharpe + 1e-6 >= sharpe and len(filtered_portfolio) >= len(portfolio):
+            self.log(
+                f"   Rozšíření na {len(filtered_portfolio)} pozic s Sharpe {filtered_sharpe:.3f} (původně {sharpe:.3f})."
+            )
+            return filtered_portfolio, filtered_weights, filtered_sharpe
+
+        return portfolio, weights, sharpe
 
     def _refine_final_portfolio(self) -> tuple[list[StockRecord], np.ndarray, float]:
         """Global re-optimization from širší množiny tickerů.
