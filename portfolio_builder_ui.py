@@ -115,6 +115,74 @@ def optimize_weights(expected_returns: np.ndarray, corr_matrix: np.ndarray, stds
     return weights
 
 
+def _projected_gradient_sharpe(
+    expected_returns: np.ndarray,
+    corr_matrix: np.ndarray,
+    stds: np.ndarray,
+    max_weight: float,
+    seeds: list[np.ndarray] | None = None,
+    steps: int = 250,
+    step_size: float = 0.1,
+) -> tuple[np.ndarray, float]:
+    """Projected gradient ascent for Sharpe with capped, long-only weights.
+
+    - Uses multiple restarts (seeded by greedy weights, equal weights, and risk/return heuristics).
+    - Projects onto the capped simplex after every gradient step to enforce constraints.
+    - Returns the best weights and Sharpe it encountered across all restarts.
+    """
+
+    n = len(expected_returns)
+    if n == 0:
+        return np.array([]), 0.0
+
+    cov = _safe_covariance_matrix(stds, corr_matrix.copy())
+
+    def _project(w: np.ndarray) -> np.ndarray:
+        return _rebalance_with_caps(w, max_weight)
+
+    # Build default seeds if none are supplied
+    default_seeds: list[np.ndarray] = []
+    default_seeds.append(np.ones(n) / n)  # equal weight
+    default_seeds.append(np.clip(expected_returns, 0, None))  # proportional to expected returns
+
+    seeds = seeds or []
+    seeds = [s for s in seeds if isinstance(s, np.ndarray) and len(s) == n]
+    seeds.extend(default_seeds)
+
+    best_w = _project(seeds[0]) if seeds else np.ones(n) / n
+    best_sh = portfolio_sharpe(best_w, expected_returns, corr_matrix, stds)
+
+    for seed in seeds:
+        w = _project(seed)
+        local_best_w = w.copy()
+        local_best_sh = portfolio_sharpe(w, expected_returns, corr_matrix, stds)
+        current_step = step_size
+
+        for _ in range(steps):
+            cov_w = cov @ w
+            numer = float(expected_returns @ w)
+            denom = float(np.sqrt(w @ cov_w))
+            if denom <= 1e-12:
+                break
+
+            grad = expected_returns / denom - (numer / (denom**3)) * cov_w
+            w = w + current_step * grad
+            w = _project(w)
+
+            sh = portfolio_sharpe(w, expected_returns, corr_matrix, stds)
+            if sh > local_best_sh + 1e-10:
+                local_best_sh = sh
+                local_best_w = w.copy()
+
+            current_step *= 0.995
+
+        if local_best_sh > best_sh + 1e-10:
+            best_sh = local_best_sh
+            best_w = local_best_w
+
+    return best_w, best_sh
+
+
 def portfolio_sharpe(weights: np.ndarray, expected_returns: np.ndarray, corr_matrix: np.ndarray, stds: np.ndarray) -> float:
     cov = _safe_covariance_matrix(stds, corr_matrix.copy())
     port_ret = float(weights @ expected_returns)
@@ -308,14 +376,34 @@ class PortfolioBuilder:
             self.log(f"Greedy Sharpe finálního portfolia: {greedy_sharpe:.3f}")
 
             refined_portfolio, refined_weights, refined_sharpe = self._refine_final_portfolio()
-            if refined_sharpe > greedy_sharpe + 1e-6:
+            best_portfolio = portfolio
+            best_weights = greedy_weights
+            best_sharpe = greedy_sharpe
+
+            if refined_sharpe > best_sharpe + 1e-6:
                 self.log(
                     f"Refinement zlepšil Sharpe na {refined_sharpe:.3f}; aktualizuji portfolia a váhy."
                 )
-                portfolio = refined_portfolio
-                final_weights = refined_weights
-            else:
-                final_weights = greedy_weights
+                best_portfolio = refined_portfolio
+                best_weights = refined_weights
+                best_sharpe = refined_sharpe
+
+            # Projected-gradient polish on the best-so-far set (dlouhé váhy, capped)
+            corr_pg = build_correlation_matrix([r.ticker for r in best_portfolio], self.cache, self.log)
+            expected_pg = np.array([r.forecast_pct for r in best_portfolio])
+            stds_pg = np.array([r.std_pct for r in best_portfolio])
+            pg_weights, pg_sharpe = _projected_gradient_sharpe(
+                expected_pg, corr_pg, stds_pg, self.max_weight, seeds=[best_weights]
+            )
+            if pg_sharpe > best_sharpe + 1e-6:
+                self.log(
+                    f"Projektovaný gradient zvýšil Sharpe na {pg_sharpe:.3f}; používám vylepšené váhy."
+                )
+                best_weights = pg_weights
+                best_sharpe = pg_sharpe
+
+            final_weights = best_weights
+            portfolio = best_portfolio
 
             for t, w in zip([r.ticker for r in portfolio], final_weights):
                 self.log(f"Konečná váha {t}: {w:.2%}")
