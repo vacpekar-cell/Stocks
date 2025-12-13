@@ -331,12 +331,20 @@ class PortfolioApp:
 
     @staticmethod
     def _to_float(value) -> float:
-        """Robustně převede hodnotu na float včetně zápisů s procenty.
+        """Převede hodnotu na float bez dalších úprav."""
 
-        Pokud vstup obsahuje znak `%`, vrátí hodnotu již převedenou na desetinný
-        tvar (tj. `3.5%` -> `0.035`). To umožní korektně porovnávat Sharpeho
-        poměr, kde očekávaný výnos i směrodatná odchylka musí být ve stejném
-        měřítku.
+        if isinstance(value, str):
+            value = value.replace("%", "").replace(",", ".").strip()
+        return float(value)
+
+    @staticmethod
+    def _to_percent_decimal(value) -> float:
+        """Převede hodnotu na desetinné vyjádření procent.
+
+        - Pokud je vstup ve tvaru řetězce s `%`, odstraní znak a vydělí 100.
+        - Pokud je vstup číslo, považuje ho za již správně škálované (např. 0.031
+          znamená 3.1 %). Nevkládá se žádná heuristika typu ">1 je procento",
+          aby byla zachována konzistence napříč sloupci.
         """
 
         percent = False
@@ -345,12 +353,7 @@ class PortfolioApp:
             value = value.replace("%", "").replace(",", ".").strip()
 
         number = float(value)
-        # Pokud je hodnota ve formátu procent (obsahuje "%"), nebo je výrazně
-        # větší než 1 (typicky 3.5 pro "3.5 %"), považujeme ji za procenta a
-        # převedeme na desetinný tvar.
-        if percent or abs(number) > 1.0:
-            number /= 100.0
-        return number
+        return number / 100.0 if percent else number
 
     def load_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV / CLS", "*.csv *.cls"), ("All files", "*.*")])
@@ -369,8 +372,8 @@ class PortfolioApp:
                 rec = StockRecord(
                     ticker=str(row.iloc[0]).strip(),
                     sharpe=self._to_float(row.iloc[1]),
-                    forecast_pct=self._to_float(row.iloc[2]),
-                    std_pct=self._to_float(row.iloc[3]),
+                    forecast_pct=self._to_percent_decimal(row.iloc[2]),
+                    std_pct=self._to_percent_decimal(row.iloc[3]),
                 )
                 if rec.ticker:
                     self.records.append(rec)
