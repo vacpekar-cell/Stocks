@@ -144,6 +144,38 @@ class ReturnCache:
         return returns
 
 
+def _coerce_to_series(series, ticker: str, log_fn) -> pd.Series:
+    """Convert arbitrary return containers to a 1D Series, falling back to empty."""
+
+    if isinstance(series, pd.Series):
+        return series
+
+    if isinstance(series, pd.DataFrame):
+        if series.empty:
+            return pd.Series(dtype=float)
+        # Prefer first column if multiple are present
+        return series.iloc[:, 0]
+
+    try:
+        arr = np.asarray(series)
+    except Exception:
+        log_fn(f"Nelze převést návratnosti pro {ticker}, používám prázdné.")
+        return pd.Series(dtype=float)
+
+    if arr.size == 0:
+        return pd.Series(dtype=float)
+
+    if arr.ndim > 1:
+        log_fn(f"Očekával jsem 1D návratnosti pro {ticker}, redukuji tvar {arr.shape} na vektor.")
+        arr = arr.reshape(-1)
+
+    try:
+        return pd.Series(arr)
+    except Exception:
+        log_fn(f"Nelze vytvořit sérii návratností pro {ticker}, používám prázdné.")
+        return pd.Series(dtype=float)
+
+
 def build_correlation_matrix(tickers: list[str], cache: ReturnCache, log_fn) -> np.ndarray:
     if not tickers:
         return np.zeros((0, 0))
@@ -151,9 +183,7 @@ def build_correlation_matrix(tickers: list[str], cache: ReturnCache, log_fn) -> 
     series_map: dict[str, pd.Series] = {}
     for ticker in tickers:
         series = cache.get_returns(ticker, log_fn)
-        if not isinstance(series, pd.Series):
-            series = pd.Series(series)
-        series_map[ticker] = series
+        series_map[ticker] = _coerce_to_series(series, ticker, log_fn)
 
     # pd.concat is more forgiving when some entries are scalars/empty; if still empty, fall back to zeros
     aligned = pd.concat(series_map, axis=1).dropna(how="all") if series_map else pd.DataFrame()
