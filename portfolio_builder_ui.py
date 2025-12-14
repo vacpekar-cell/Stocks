@@ -121,8 +121,9 @@ def _projected_gradient_sharpe(
     stds: np.ndarray,
     max_weight: float,
     seeds: list[np.ndarray] | None = None,
-    steps: int = 250,
-    step_size: float = 0.1,
+    steps: int = 400,
+    step_size: float = 0.12,
+    random_restarts: int = 5,
 ) -> tuple[np.ndarray, float]:
     """Projected gradient ascent for Sharpe with capped, long-only weights.
 
@@ -148,6 +149,10 @@ def _projected_gradient_sharpe(
     seeds = seeds or []
     seeds = [s for s in seeds if isinstance(s, np.ndarray) and len(s) == n]
     seeds.extend(default_seeds)
+
+    rng = np.random.default_rng()
+    for _ in range(random_restarts):
+        seeds.append(rng.random(n))
 
     best_w = _project(seeds[0]) if seeds else np.ones(n) / n
     best_sh = portfolio_sharpe(best_w, expected_returns, corr_matrix, stds)
@@ -521,8 +526,9 @@ class PortfolioBuilder:
             return portfolio, weights, sharpe
 
         slots_to_fill = self.max_positions - len(portfolio)
-        # Zvažme více kandidátů než je potřeba, aby optimalizace měla prostor
-        extra = unused[: max(slots_to_fill * 2, slots_to_fill)]
+        # Zvažme výrazně více kandidátů než je potřeba, aby optimalizace měla prostor
+        candidate_count = max(slots_to_fill * 6, self.max_positions * 4, 30)
+        extra = unused[: min(len(unused), candidate_count)]
         expanded = portfolio + extra
 
         tickers = [r.ticker for r in expanded]
@@ -539,10 +545,10 @@ class PortfolioBuilder:
         if remaining > 0 and len(expanded) > len(weights):
             padded[len(weights) :] = remaining / (len(expanded) - len(weights))
 
-        seeds = [padded]
+        seeds = [padded, np.ones(len(expanded)) / len(expanded), np.clip(expected, 0, None)]
 
         pg_weights, pg_sharpe = _projected_gradient_sharpe(
-            expected, corr, stds, self.max_weight, seeds=seeds
+            expected, corr, stds, self.max_weight, seeds=seeds, random_restarts=8, steps=500
         )
 
         # Ponecháme nejvyšší váhy do cílového počtu, zbytek zahodíme
@@ -553,6 +559,8 @@ class PortfolioBuilder:
         filtered_portfolio = [r for r, keep in zip(expanded, mask) if keep]
         filtered_weights = pg_weights[mask]
 
+        # Keep weights strictly positive before projection to avoid nulové alokace
+        filtered_weights = np.maximum(filtered_weights, 1e-6)
         filtered_weights = _rebalance_with_caps(filtered_weights, self.max_weight)
         filtered_sharpe = portfolio_sharpe(
             filtered_weights,
@@ -582,7 +590,7 @@ class PortfolioBuilder:
         if not self.records:
             return [], np.array([]), 0.0
 
-        pool_size = min(len(self.records), max(1, min(self.max_positions * 5, 100)))
+        pool_size = min(len(self.records), max(1, min(self.max_positions * 8, 200)))
         candidate_pool = self.records[:pool_size]
 
         # Start with full pool
