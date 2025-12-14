@@ -5,6 +5,7 @@ import threading
 import tkinter as tk
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
+import time
 
 import importlib.util
 
@@ -124,6 +125,8 @@ def _projected_gradient_sharpe(
     steps: int = 400,
     step_size: float = 0.12,
     random_restarts: int = 5,
+    stop_event: threading.Event | None = None,
+    max_seconds: float = 20.0,
 ) -> tuple[np.ndarray, float]:
     """Projected gradient ascent for Sharpe with capped, long-only weights.
 
@@ -137,6 +140,7 @@ def _projected_gradient_sharpe(
         return np.array([]), 0.0
 
     cov = _safe_covariance_matrix(stds, corr_matrix.copy())
+    deadline = time.monotonic() + max_seconds
 
     def _project(w: np.ndarray) -> np.ndarray:
         return _rebalance_with_caps(w, max_weight)
@@ -158,12 +162,20 @@ def _projected_gradient_sharpe(
     best_sh = portfolio_sharpe(best_w, expected_returns, corr_matrix, stds)
 
     for seed in seeds:
+        if stop_event is not None and stop_event.is_set():
+            break
+        if time.monotonic() >= deadline:
+            break
         w = _project(seed)
         local_best_w = w.copy()
         local_best_sh = portfolio_sharpe(w, expected_returns, corr_matrix, stds)
         current_step = step_size
 
         for _ in range(steps):
+            if stop_event is not None and stop_event.is_set():
+                break
+            if time.monotonic() >= deadline:
+                break
             cov_w = cov @ w
             numer = float(expected_returns @ w)
             denom = float(np.sqrt(w @ cov_w))
@@ -281,22 +293,38 @@ def build_correlation_matrix(tickers: list[str], cache: ReturnCache, log_fn) -> 
 
 
 class PortfolioBuilder:
-    def __init__(self, records: list[StockRecord], max_positions: int = 10, max_weight: float = 0.25, log_fn=print):
+    def __init__(
+        self,
+        records: list[StockRecord],
+        max_positions: int = 10,
+        max_weight: float = 0.25,
+        log_fn=print,
+        stop_event: threading.Event | None = None,
+    ):
         self.records = sorted(records, key=lambda r: r.sharpe, reverse=True)
         self.max_positions = max_positions
         self.max_weight = max_weight
         self.log = log_fn
         self.cache = ReturnCache()
+        self.stop_event = stop_event
 
-    def build(self):
+    def _should_stop(self) -> bool:
+        if self.stop_event is not None and self.stop_event.is_set():
+            self.log("Výpočet byl zastaven uživatelem.")
+            return True
+        return False
+
+    def build(self) -> tuple[list[StockRecord], np.ndarray, float]:
         if not self.records:
             self.log("Seznam akcií je prázdný.")
-            return []
+            return [], np.array([]), 0.0
 
         portfolio: list[StockRecord] = [self.records[0]]
         self.log(f"1) Přidávám {portfolio[0].ticker} s nejvyšším Sharpe {portfolio[0].sharpe:.3f}.")
 
         while len(portfolio) < min(self.max_positions, len(self.records)):
+            if self._should_stop():
+                return portfolio, np.array([]), 0.0
             remaining = [r for r in self.records if r.ticker not in {p.ticker for p in portfolio}]
             candidates = remaining[:50]
             if not candidates:
@@ -307,6 +335,8 @@ class PortfolioBuilder:
 
             # Build correlation matrix for current portfolio plus candidate to evaluate
             for candidate in candidates:
+                if self._should_stop():
+                    return portfolio, np.array([]), 0.0
                 trial_list = portfolio + [candidate]
                 tickers = [r.ticker for r in trial_list]
                 corr_matrix = build_correlation_matrix(tickers, self.cache, self.log)
@@ -398,7 +428,12 @@ class PortfolioBuilder:
             expected_pg = np.array([r.forecast_pct for r in best_portfolio])
             stds_pg = np.array([r.std_pct for r in best_portfolio])
             pg_weights, pg_sharpe = _projected_gradient_sharpe(
-                expected_pg, corr_pg, stds_pg, self.max_weight, seeds=[best_weights]
+                expected_pg,
+                corr_pg,
+                stds_pg,
+                self.max_weight,
+                seeds=[best_weights],
+                stop_event=self.stop_event,
             )
             if pg_sharpe > best_sharpe + 1e-6:
                 self.log(
@@ -422,7 +457,12 @@ class PortfolioBuilder:
             for t, w in zip([r.ticker for r in portfolio], final_weights):
                 self.log(f"Konečná váha {t}: {w:.2%}")
 
-        return portfolio
+            # seřazení podle váhy pro finální reporting
+            order = np.argsort(final_weights)[::-1]
+            portfolio = [portfolio[i] for i in order]
+            final_weights = final_weights[order]
+
+        return portfolio, final_weights if 'final_weights' in locals() else np.array([]), final_sharpe if 'final_sharpe' in locals() else 0.0
 
     def _prune_and_polish_final(
         self, portfolio: list[StockRecord], weights: np.ndarray, sharpe: float
@@ -440,6 +480,8 @@ class PortfolioBuilder:
 
         changed = True
         while changed and len(current_portfolio) > 0:
+            if self._should_stop():
+                break
             changed = False
             mask = current_weights > tol
             if mask.all():
@@ -472,7 +514,7 @@ class PortfolioBuilder:
         seed_weights.append(closed_form)
 
         pg_weights, pg_sharpe = _projected_gradient_sharpe(
-            expected, corr, stds, self.max_weight, seeds=seed_weights
+            expected, corr, stds, self.max_weight, seeds=seed_weights, stop_event=self.stop_event
         )
 
         best_weights = current_weights
@@ -531,6 +573,9 @@ class PortfolioBuilder:
         extra = unused[: min(len(unused), candidate_count)]
         expanded = portfolio + extra
 
+        if self._should_stop():
+            return portfolio, weights, sharpe
+
         tickers = [r.ticker for r in expanded]
         corr = build_correlation_matrix(tickers, self.cache, self.log)
         expected = np.array([r.forecast_pct for r in expanded])
@@ -548,7 +593,15 @@ class PortfolioBuilder:
         seeds = [padded, np.ones(len(expanded)) / len(expanded), np.clip(expected, 0, None)]
 
         pg_weights, pg_sharpe = _projected_gradient_sharpe(
-            expected, corr, stds, self.max_weight, seeds=seeds, random_restarts=8, steps=500
+            expected,
+            corr,
+            stds,
+            self.max_weight,
+            seeds=seeds,
+            random_restarts=8,
+            steps=500,
+            stop_event=self.stop_event,
+            max_seconds=40.0,
         )
 
         # Ponecháme nejvyšší váhy do cílového počtu, zbytek zahodíme
@@ -596,6 +649,8 @@ class PortfolioBuilder:
         # Start with full pool
         current = candidate_pool.copy()
         while len(current) > self.max_positions:
+            if self._should_stop():
+                break
             tickers = [r.ticker for r in current]
             corr = build_correlation_matrix(tickers, self.cache, self.log)
             expected = np.array([r.forecast_pct for r in current])
@@ -632,6 +687,8 @@ class PortfolioApp:
         self.root.title("Portfolio Builder")
 
         self.records: list[StockRecord] = []
+        self.stop_event: threading.Event | None = None
+        self.worker_thread: threading.Thread | None = None
 
         main = ttk.Frame(root, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
@@ -649,7 +706,11 @@ class PortfolioApp:
         self.cap_var = tk.DoubleVar(value=0.25)
         ttk.Entry(control_frame, textvariable=self.cap_var, width=8).pack(side=tk.LEFT)
 
-        ttk.Button(control_frame, text="Sestavit portfolio", command=self.start_build).pack(side=tk.RIGHT)
+        self.stop_button = ttk.Button(control_frame, text="Zastavit", command=self.request_stop, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.RIGHT, padx=(5, 0))
+
+        self.start_button = ttk.Button(control_frame, text="Sestavit portfolio", command=self.start_build)
+        self.start_button.pack(side=tk.RIGHT)
 
         self.tree = ttk.Treeview(main, columns=("ticker", "sharpe", "forecast", "std"), show="headings", height=8)
         for col, text in zip(self.tree["columns"], ["Ticker", "Sharpe", "Forecast %", "Std %"]):
@@ -752,6 +813,10 @@ class PortfolioApp:
         )
 
     def start_build(self):
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            messagebox.showinfo("Probíhá výpočet", "Vyčkejte na dokončení nebo použijte 'Zastavit'.")
+            return
+
         if not self.records:
             messagebox.showwarning("Upozornění", "Nejdříve načtěte CSV se seznamem akcií.")
             return
@@ -767,13 +832,72 @@ class PortfolioApp:
             messagebox.showerror("Chyba", "Počet pozic musí být kladný.")
             return
 
-        def worker():
-            builder = PortfolioBuilder(self.records, max_positions=count, max_weight=cap, log_fn=self.log)
-            portfolio = builder.build()
-            tickers = ", ".join(r.ticker for r in portfolio)
-            self.log(f"Hotovo. Portfolio: {tickers}")
+        self.stop_event = threading.Event()
+        self.start_button.configure(state=tk.DISABLED)
+        self.stop_button.configure(state=tk.NORMAL)
 
-        threading.Thread(target=worker, daemon=True).start()
+        def worker():
+            try:
+                builder = PortfolioBuilder(
+                    self.records,
+                    max_positions=count,
+                    max_weight=cap,
+                    log_fn=self.log,
+                    stop_event=self.stop_event,
+                )
+                portfolio, weights, sharpe = builder.build()
+                if self.stop_event.is_set():
+                    self.log("Výpočet ukončen na žádost uživatele.")
+                    return
+                self._report_results(portfolio, weights, sharpe)
+            except Exception as exc:  # pragma: no cover - UI error path
+                self.log(f"Chyba při výpočtu: {exc}")
+                messagebox.showerror("Chyba", str(exc))
+            finally:
+                self.start_button.configure(state=tk.NORMAL)
+                self.stop_button.configure(state=tk.DISABLED)
+
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
+
+    def request_stop(self):
+        if self.stop_event is not None:
+            self.stop_event.set()
+
+    def _report_results(self, portfolio: list[StockRecord], weights: np.ndarray, sharpe: float):
+        if not portfolio or weights.size == 0:
+            self.log("Výsledek je prázdný.")
+            return
+
+        tickers = [r.ticker for r in portfolio]
+        corr = build_correlation_matrix(tickers, ReturnCache(), self.log)
+        expected = np.array([r.forecast_pct for r in portfolio])
+        stds = np.array([r.std_pct for r in portfolio])
+        cov = _safe_covariance_matrix(stds, corr.copy())
+        port_ret = float(weights @ expected)
+        port_vol = float(np.sqrt(weights @ cov @ weights))
+
+        self.log(f"Hotovo. Portfolio: {', '.join(tickers)}")
+        self.log(
+            f"Sharpe: {sharpe:.3f}, očekávaný výnos portfolia: {port_ret*100:.2f} %, směrodatná odchylka: {port_vol*100:.2f} %"
+        )
+
+        table = pd.DataFrame(
+            {
+                "Ticker": tickers,
+                "Váha %": weights * 100,
+                "Očekávaný výnos %": expected * 100,
+                "Směrodatná odchylka %": stds * 100,
+            }
+        )
+        self.log("Váhy a parametry (seřazeno dle váhy):")
+        for line in table.to_string(index=False, float_format=lambda x: f"{x:6.2f}").splitlines():
+            self.log(f"   {line}")
+
+        corr_df = pd.DataFrame(corr, index=tickers, columns=tickers)
+        self.log("Korelační matice finálního portfolia:")
+        for line in corr_df.round(2).to_string().splitlines():
+            self.log(f"   {line}")
 
 
 def main():
