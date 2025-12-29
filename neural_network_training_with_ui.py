@@ -5,7 +5,6 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
 import pickle
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -383,8 +382,6 @@ class TrainingThread(threading.Thread):
             device = torch.device("cuda:0" if use_gpu else "cpu")
             
             timestamp = self.params['timestamp']
-            continue_training = self.params.get('continue_training', False)
-            pretrained_models = self.params.get('pretrained_models', [])
             
             gc.collect()
             if use_gpu:
@@ -413,8 +410,6 @@ class TrainingThread(threading.Thread):
             weight_decay = self.params['weight_decay']
             use_sigmoid = self.params['use_sigmoid']
 
-            pretrained_models = self.params.get('pretrained_models', {})
-
             results = []
             trained_models = []
 
@@ -425,43 +420,94 @@ class TrainingThread(threading.Thread):
 
                 horizon = task['horizon']
                 self.app.current_network_id = horizon
+                fold_tasks = task.get('folds', [])
+                if not fold_tasks:
+                    self.app.thread_safe_logger.log(f"Varování: Žádné foldy pro {horizon}, přeskočeno.")
+                    continue
 
-                pretrained_model = pretrained_models.get(horizon)
-                if continue_training and pretrained_model:
-                    self.app.thread_safe_logger.log(
-                        f"\n--- Pokračování tréninku horizontu {horizon} z modelu {os.path.basename(pretrained_model)} ---"
-                    )
-                else:
-                    self.app.thread_safe_logger.log(f"\n--- Trénování nového horizontu {horizon} ---")
-
-                train_outcome = self.train_single_model(
-                    network_id=horizon,
-                    X_train=task['X_train'],
-                    y_train=task['y_train'],
-                    X_val=task['X_val'],
-                    y_val=task['y_val'],
-                    meta_train_X=task['meta_train_X'],
-                    meta_val_X=task['meta_val_X'],
-                    meta_train_y=task['meta_train_y'],
-                    meta_val_y=task['meta_val_y'],
-                    timestamp=timestamp,
-                    batch_size=batch_size,
-                    epochs=epochs,
-                    patience=patience,
-                    device=device,
-                    use_mixed_precision=use_mixed_precision,
-                    use_augmentation=use_augmentation,
-                    noise_level=noise_level,
-                    mixup_prob=mixup_prob,
-                    learning_rate=learning_rate,
-                    weight_decay=weight_decay,
-                    use_sigmoid=use_sigmoid,
-                    dropout_rate=dropout_rate,
-                    scheduler_type=scheduler_type,
-                    min_lr=min_lr,
-                    pretrained_model=pretrained_model,
-                    output_dim=1
+                self.app.thread_safe_logger.log(
+                    f"\n--- Trénování horizontu {horizon} ({len(fold_tasks)} rolling foldů) ---"
                 )
+
+                best_fold = None
+                best_val_loss = float('inf')
+                best_entry = None
+
+                for fold_task in fold_tasks:
+                    if self.stop_event.is_set():
+                        break
+
+                    fold_id = fold_task['fold_id']
+                    display_id = f"{horizon}/fold{fold_id}"
+                    file_tag = f"{horizon}_fold{fold_id}"
+                    has_meta = len(fold_task['meta_train_X']) > 0 and len(fold_task['meta_val_X']) > 0
+
+                    self.app.thread_safe_logger.log(
+                        f"\n--- Fold {fold_id}: trénink {display_id} ---"
+                    )
+
+                    train_outcome = self.train_single_model(
+                        network_id=horizon,
+                        display_id=display_id,
+                        file_tag=file_tag,
+                        X_train=fold_task['X_train'],
+                        y_train=fold_task['y_train'],
+                        X_val=fold_task['X_val'],
+                        y_val=fold_task['y_val'],
+                        meta_train_X=fold_task['meta_train_X'],
+                        meta_val_X=fold_task['meta_val_X'],
+                        meta_train_y=fold_task['meta_train_y'],
+                        meta_val_y=fold_task['meta_val_y'],
+                        timestamp=timestamp,
+                        batch_size=batch_size,
+                        epochs=epochs,
+                        patience=patience,
+                        device=device,
+                        use_mixed_precision=use_mixed_precision,
+                        use_augmentation=use_augmentation,
+                        noise_level=noise_level,
+                        mixup_prob=mixup_prob,
+                        learning_rate=learning_rate,
+                        weight_decay=weight_decay,
+                        use_sigmoid=use_sigmoid,
+                        dropout_rate=dropout_rate,
+                        scheduler_type=scheduler_type,
+                        min_lr=min_lr,
+                        output_dim=1,
+                        run_meta=has_meta,
+                    )
+
+                    if self.stop_event.is_set():
+                        break
+
+                    fold_val = train_outcome.get('val_loss', float('inf'))
+                    if fold_val < best_val_loss:
+                        best_val_loss = fold_val
+                        best_fold = fold_id
+                        best_entry = train_outcome
+
+                if self.stop_event.is_set():
+                    break
+
+                if not best_entry:
+                    self.app.thread_safe_logger.log(f"Varování: {horizon} nemá žádný úspěšný fold.")
+                    continue
+
+                self.app.thread_safe_logger.log(
+                    f"Nejlepší fold pro {horizon}: {best_fold} (val_loss {best_val_loss:.6f})"
+                )
+
+                best_model_state = best_entry.get('model_state')
+                if best_model_state is not None:
+                    model_file = f"model_resnet_{horizon}_{timestamp}.pt"
+                    torch.save(best_model_state, model_file)
+                    self.app.thread_safe_logger.log(f"Uloženo nejlepší modelové váhy jako '{model_file}'")
+
+                best_meta_state = best_entry.get('meta_state')
+                if best_meta_state is not None:
+                    meta_file = f"meta_resnet_{horizon}_{timestamp}.pt"
+                    torch.save(best_meta_state, meta_file)
+                    self.app.thread_safe_logger.log(f"Uloženo nejlepší váhy metasítě jako '{meta_file}'")
 
                 if self.stop_event.is_set():
                     break
@@ -471,9 +517,9 @@ class TrainingThread(threading.Thread):
                         'timestamp': timestamp,
                         'model_type': 'resnet',
                         'horizon': horizon,
-                        'val_loss': train_outcome.get('val_loss', float('inf')),
-                        'meta_val_loss': train_outcome.get('meta_val_loss'),
-                        'continued_training': continue_training,
+                        'val_loss': best_entry.get('val_loss', float('inf')),
+                        'meta_val_loss': best_entry.get('meta_val_loss'),
+                        'best_fold': best_fold,
                         'epochs': epochs,
                         'batch_size': batch_size,
                         'learning_rate': learning_rate,
@@ -487,7 +533,7 @@ class TrainingThread(threading.Thread):
                         'seed': seed,
                     }
                 )
-                trained_models.append(train_outcome)
+                trained_models.append(best_entry)
 
             if not self.stop_event.is_set():
                 self.app.thread_safe_logger.log(f"\n=== Trénink dokončen (ID: {timestamp}) ===")
@@ -549,7 +595,7 @@ class TrainingThread(threading.Thread):
                            use_mixed_precision=False, use_augmentation=False, noise_level=0.03,
                            mixup_prob=0.2, learning_rate=0.001, weight_decay=0.0001, use_sigmoid=True,
                            dropout_rate=0.25, scheduler_type='cosine', min_lr='1e-6',
-                           pretrained_model=None, output_dim=3):
+                           output_dim=3, display_id=None, file_tag=None, run_meta=True):
         try:
             if self.stop_event.is_set():
                 return {'horizon': network_id, 'val_loss': float('inf'), 'meta_val_loss': None}
@@ -562,18 +608,8 @@ class TrainingThread(threading.Thread):
                 mem_allocated = torch.cuda.memory_allocated() / 1024**2
                 self.app.thread_safe_logger.log(f"GPU využití před tréninkem: {mem_allocated:.1f}MB")
             
-            if pretrained_model:
-                pretrained_state = torch.load(pretrained_model, map_location='cpu')
-                inferred_dim = infer_output_dim_from_state_dict(pretrained_state)
-                if inferred_dim != output_dim:
-                    self.app.thread_safe_logger.log(
-                        f"Upravena výstupní dimenze na {inferred_dim} podle checkpointu {os.path.basename(pretrained_model)}"
-                    )
-                    output_dim = inferred_dim
-                    if y_train.shape[1] != output_dim:
-                        raise ValueError(
-                            f"Checkpoint očekává {output_dim} cílových sloupců, ale dataset má {y_train.shape[1]}"
-                        )
+            display_id = display_id or network_id
+            file_tag = file_tag or network_id
 
             if use_augmentation:
                 train_dataset = FinancialDataset(X_train, y_train, transform=True,
@@ -610,11 +646,6 @@ class TrainingThread(threading.Thread):
                 output_dim=output_dim
             )
             
-            # Načtení předtrénovaného modelu, pokud je k dispozici
-            if pretrained_model:
-                self.app.thread_safe_logger.log(f"Načítání vah z modelu: {os.path.basename(pretrained_model)}")
-                model.load_state_dict(pretrained_state)
-                
             model.to(device)
             
             activation = "Sigmoid" if use_sigmoid else "LeakyReLU"
@@ -636,9 +667,10 @@ class TrainingThread(threading.Thread):
             
             criterion = nn.MSELoss()
             
-            logger = TrainingLogger(self.app.thread_safe_logger, network_id, patience=patience)
+            logger = TrainingLogger(self.app.thread_safe_logger, display_id, patience=patience)
             logger.start_training()
-            self.app.training_loggers[str(network_id)] = logger
+            self.app.training_loggers[str(display_id)] = logger
+            self.app.root.after(0, lambda: self.app.add_network_option(display_id))
             
             scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
             
@@ -649,7 +681,7 @@ class TrainingThread(threading.Thread):
             
             for epoch in range(epochs):
                 if self.stop_event.is_set():
-                    self.app.thread_safe_logger.log(f"Trénink sítě {network_id} přerušen.")
+                    self.app.thread_safe_logger.log(f"Trénink sítě {display_id} přerušen.")
                     break
                 
                 model.train()
@@ -745,31 +777,31 @@ class TrainingThread(threading.Thread):
                 
                 if epoch % 5 == 0:
                     plot_data = logger.get_plotting_data()
-                    self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(network_id), plot_data))
+                    self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(display_id), plot_data))
             
             if self.stop_event.is_set():
-                return float('inf')
+                return {'horizon': network_id, 'val_loss': float('inf'), 'meta_val_loss': None}
 
             logger.finish()
 
-            model_file = f"model_resnet_{network_id}_{timestamp}.pt"
+            model_file = f"model_resnet_{file_tag}_{timestamp}.pt"
             model.load_state_dict(best_model_state)
             model.to(device)
             model.eval()
 
             torch.save(best_model_state, model_file)
 
-            self.app.thread_safe_logger.log(f"Síť {network_id} dokončena. Nejlepší validační ztráta: {best_val_loss:.6f}")
+            self.app.thread_safe_logger.log(f"Síť {display_id} dokončena. Nejlepší validační ztráta: {best_val_loss:.6f}")
             self.app.thread_safe_logger.log(f"Model uložen jako '{model_file}'")
 
             try:
-                if len(meta_train_X) == 0 or len(meta_val_X) == 0:
+                if not run_meta or len(meta_train_X) == 0 or len(meta_val_X) == 0:
                     self.app.thread_safe_logger.log(
-                        f"Metasíť pro horizont {network_id} přeskočena: k dispozici je méně než 10 % dat pro meta trénink."
+                        f"Metasíť pro {display_id} přeskočena: není k dispozici meta segment."
                     )
                 else:
                     meta_val_loss, meta_state = self.train_meta_model(
-                        network_id,
+                        display_id,
                         timestamp,
                         model_state=best_model_state,
                         X_train=meta_train_X,
@@ -781,18 +813,19 @@ class TrainingThread(threading.Thread):
                         use_mixed_precision=use_mixed_precision,
                         dropout_rate=dropout_rate,
                         use_sigmoid=use_sigmoid,
+                        file_tag=file_tag,
                     )
                     if meta_state is not None:
                         self.app.thread_safe_logger.log(
-                            f"Metasíť pro horizont {network_id} dokončena. Nejlepší validační ztráta: {meta_val_loss:.6f}"
+                            f"Metasíť pro {display_id} dokončena. Nejlepší validační ztráta: {meta_val_loss:.6f}"
                         )
             except Exception as exc:
                 self.app.thread_safe_logger.log(
-                    f"Varování: trénink metasítě pro {network_id} selhal: {exc}"
+                    f"Varování: trénink metasítě pro {display_id} selhal: {exc}"
                 )
 
             plot_data = logger.get_plotting_data()
-            self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(network_id), plot_data))
+            self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(display_id), plot_data))
             
             del model, optimizer, criterion
             if scaler is not None:
@@ -832,6 +865,7 @@ class TrainingThread(threading.Thread):
         use_mixed_precision,
         dropout_rate,
         use_sigmoid,
+        file_tag=None,
     ):
         try:
             base_model = EfficientResNet(
@@ -886,6 +920,12 @@ class TrainingThread(threading.Thread):
             patience_counter = 0
             meta_epochs = 150
 
+            meta_logger_id = f"{network_id}-meta"
+            logger = TrainingLogger(self.app.thread_safe_logger, meta_logger_id, patience=patience)
+            logger.start_training()
+            self.app.training_loggers[str(meta_logger_id)] = logger
+            self.app.root.after(0, lambda: self.app.add_network_option(meta_logger_id))
+
             for epoch in range(meta_epochs):
                 if self.stop_event.is_set():
                     break
@@ -921,6 +961,8 @@ class TrainingThread(threading.Thread):
 
                 meta_model.eval()
                 val_loss = 0.0
+                val_outputs = []
+                val_targets = []
                 with torch.no_grad():
                     for inputs, targets in val_loader:
                         inputs = inputs.to(device, non_blocking=True)
@@ -935,9 +977,15 @@ class TrainingThread(threading.Thread):
                             loss = criterion(outputs, targets)
 
                         val_loss += loss.item() * inputs.size(0)
+                        val_outputs.append(outputs.cpu())
+                        val_targets.append(targets.cpu())
 
                 val_loss /= len(val_loader.dataset)
                 scheduler.step()
+                val_outputs_cat = torch.cat(val_outputs)
+                val_targets_cat = torch.cat(val_targets)
+                mse = F.mse_loss(val_outputs_cat, val_targets_cat).item()
+                rmse = np.sqrt(mse)
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -946,13 +994,22 @@ class TrainingThread(threading.Thread):
                 else:
                     patience_counter += 1
 
+                logger.log(epoch, meta_epochs, train_loss, val_loss, optimizer.param_groups[0]['lr'], rmse)
+
                 if patience_counter >= patience:
                     break
+
+                if epoch % 5 == 0:
+                    plot_data = logger.get_plotting_data()
+                    self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(meta_logger_id), plot_data))
 
             if best_state is not None:
                 meta_model.load_state_dict(best_state)
 
-            meta_model_file = f"meta_resnet_{network_id}_{timestamp}.pt"
+            logger.finish()
+
+            file_tag = file_tag or network_id
+            meta_model_file = f"meta_resnet_{file_tag}_{timestamp}.pt"
             torch.save(meta_model.state_dict(), meta_model_file)
             self.app.thread_safe_logger.log(f"Metasíť uložena jako '{meta_model_file}'")
 
@@ -988,7 +1045,6 @@ class NeuralNetApp:
         self.use_mixed_precision = tk.BooleanVar(value=torch.cuda.is_available())
         self.use_augmentation = tk.BooleanVar(value=True)
         self.use_sigmoid = tk.BooleanVar(value=True)
-        self.randomize = tk.BooleanVar(value=False)  # Přidáno - pro nový trénink od začátku
         self.training_columns = None
         self.training_loggers = {}
         self.best_models = {}
@@ -1030,16 +1086,7 @@ class NeuralNetApp:
         ttk.Entry(file_frame, textvariable=self.output_file, width=50).grid(row=1, column=1, padx=5)
         ttk.Button(file_frame, text="Procházet", command=self.browse_output).grid(row=1, column=2, padx=5)
         
-        # Přidáno - frame pro načtení modelů
-        models_frame = ttk.LabelFrame(train_tab, text="Pokračování tréninku", padding=10)
-        models_frame.pack(fill=tk.X, pady=5)
-        
         self.loaded_models_var = tk.StringVar()
-        ttk.Label(models_frame, text="Načtené modely:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(models_frame, textvariable=self.loaded_models_var, width=50, state='readonly').grid(row=0, column=1, padx=5)
-        ttk.Button(models_frame, text="Načíst modely", command=self.load_models).grid(row=0, column=2, padx=5)
-        ttk.Checkbutton(models_frame, text="Začít trénink od začátku (ignorovat načtené modely)", 
-                     variable=self.randomize).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
         
         param_frame = ttk.LabelFrame(train_tab, text="Parametry trénování", padding=10)
         param_frame.pack(fill=tk.X, pady=5)
@@ -1079,15 +1126,10 @@ class NeuralNetApp:
         self.dropout_rate.insert(0, "0.25")
         self.dropout_rate.grid(row=2, column=1, padx=5)
         
-        ttk.Label(param_frame, text="Val split:").grid(row=2, column=2, sticky=tk.W, pady=5, padx=(15,0))
-        self.val_split = ttk.Entry(param_frame, width=8)
-        self.val_split.insert(0, "0.2")
-        self.val_split.grid(row=2, column=3, padx=5)
-        
-        ttk.Label(param_frame, text="Random seed:").grid(row=2, column=4, sticky=tk.W, pady=5, padx=(15,0))
+        ttk.Label(param_frame, text="Random seed:").grid(row=2, column=2, sticky=tk.W, pady=5, padx=(15,0))
         self.random_seed = ttk.Entry(param_frame, width=8)
         self.random_seed.insert(0, "42")
-        self.random_seed.grid(row=2, column=5, padx=5)
+        self.random_seed.grid(row=2, column=3, padx=5)
         
         ttk.Checkbutton(param_frame, text="Použít GPU", 
                       variable=self.use_gpu).grid(row=3, column=0, sticky=tk.W, pady=5)
@@ -1257,45 +1299,6 @@ class NeuralNetApp:
             self.output_text.insert(tk.END, "Žádné modely nebyly načteny.\n")
         self.output_text.see(tk.END)
 
-    def load_validation_indices(self):
-        indices_map = {}
-
-        def normalize_entry(entry):
-            if isinstance(entry, dict):
-                return {
-                    'val': np.array(entry.get('val', []), dtype=int),
-                    'meta_train': np.array(entry.get('meta_train', []), dtype=int),
-                    'meta_val': np.array(entry.get('meta_val', []), dtype=int),
-                }
-            return {
-                'val': np.array(entry, dtype=int),
-                'meta_train': np.array([], dtype=int),
-                'meta_val': np.array([], dtype=int),
-            }
-
-        for model_path in self.loaded_models:
-            timestamp = infer_timestamp_from_model(model_path)
-            if not timestamp:
-                continue
-
-            candidate = f"val_indices_{timestamp}.pkl"
-            if not os.path.exists(candidate):
-                continue
-
-            try:
-                with open(candidate, "rb") as f:
-                    data = pickle.load(f)
-
-                if isinstance(data, dict):
-                    indices_map = {k: normalize_entry(v) for k, v in data.items()}
-                    self.output_text.insert(tk.END, f"Načteny validační indexy z '{candidate}'.\n")
-                    break
-            except Exception as e:
-                self.output_text.insert(tk.END, f"Varování: Nepodařilo se načíst validační indexy: {e}\n")
-
-        self.output_text.see(tk.END)
-        return indices_map
-    
     def clear_log(self):
         self.output_text.delete(1.0, tk.END)
         self.output_text.insert(tk.END, "Log vymazán.\n")
@@ -1335,6 +1338,16 @@ class NeuralNetApp:
             
             self.figure.tight_layout()
             self.canvas.draw()
+
+    def add_network_option(self, network_id):
+        if not network_id:
+            return
+        current_values = list(self.network_selector["values"]) if self.network_selector["values"] else []
+        if network_id not in current_values:
+            current_values.append(network_id)
+            self.network_selector["values"] = current_values
+            if not self.network_selector.get():
+                self.network_selector.set(network_id)
     
     def update_visualization(self, event=None):
         selected_network = self.network_selector.get()
@@ -1375,12 +1388,7 @@ class NeuralNetApp:
             
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             
-            continue_training = (len(self.loaded_models) > 0) and not self.randomize.get()
-            
-            if continue_training:
-                self.output_text.insert(tk.END, f"Pokračování tréninku s {len(self.loaded_models)} načtenými modely\n")
-            else:
-                self.output_text.insert(tk.END, "Začátek nového tréninku\n")
+            self.output_text.insert(tk.END, "Začátek nového tréninku\n")
             
             self.output_text.insert(tk.END, "Načítání dat...\n")
             self.output_text.see(tk.END)
@@ -1422,7 +1430,6 @@ class NeuralNetApp:
                 noise_level = float(self.noise_level.get())
                 mixup_prob = float(self.mixup_prob.get())
                 patience = int(self.patience.get())
-                val_split = float(self.val_split.get())
                 scheduler_type = self.scheduler_type.get()
                 min_lr = self.min_lr.get()
                 use_gpu = torch.cuda.is_available() and self.use_gpu.get()
@@ -1433,10 +1440,18 @@ class NeuralNetApp:
 
                 column_mapping = map_columns_to_horizons(y_df.columns)
                 target_tasks = []
-                split_indices_to_save = {}
 
-                saved_val_indices = self.load_validation_indices() if continue_training else {}
-                meta_fraction = 0.1
+                def build_rolling_folds(indices, num_splits=10):
+                    segments = np.array_split(indices, num_splits)
+                    folds = []
+                    for fold_idx in range(num_splits - 1):
+                        train_idx = np.concatenate(segments[:fold_idx + 1]) if segments[:fold_idx + 1] else np.array([], dtype=int)
+                        val_idx = segments[fold_idx + 1]
+                        if len(train_idx) == 0 or len(val_idx) == 0:
+                            continue
+                        meta_idx = segments[fold_idx + 2] if (fold_idx + 2) < num_splits else np.array([], dtype=int)
+                        folds.append((fold_idx + 1, train_idx, val_idx, meta_idx))
+                    return folds
 
                 for horizon in HORIZON_ORDER:
                     column = column_mapping.get(horizon)
@@ -1449,79 +1464,50 @@ class NeuralNetApp:
 
                     horizon_indices = np.nonzero(mask.values)[0]
                     y_values = series.values.reshape(-1, 1)
+                    folds = build_rolling_folds(horizon_indices, num_splits=10)
+                    if not folds:
+                        self.output_text.insert(tk.END, f"Varování: Pro {horizon} není možné vytvořit rolling split.\n")
+                        continue
 
-                    saved_entry = saved_val_indices.get(horizon, {})
-                    saved_val_idx = [idx for idx in saved_entry.get('val', []) if idx < len(X_scaled)]
-                    saved_meta_train_idx = [idx for idx in saved_entry.get('meta_train', []) if idx < len(X_scaled)]
-                    saved_meta_val_idx = [idx for idx in saved_entry.get('meta_val', []) if idx < len(X_scaled)]
+                    fold_tasks = []
+                    for fold_id, train_idx, val_idx, meta_idx in folds:
+                        meta_train_idx = np.array([], dtype=int)
+                        meta_val_idx = np.array([], dtype=int)
+                        if len(meta_idx) >= 2:
+                            split_point = int(len(meta_idx) * 0.8)
+                            split_point = max(1, min(split_point, len(meta_idx) - 1))
+                            meta_train_idx = meta_idx[:split_point]
+                            meta_val_idx = meta_idx[split_point:]
 
-                    # Meta holdout: 10% dedicated to metasít training only
-                    if saved_meta_train_idx or saved_meta_val_idx:
-                        meta_train_idx = saved_meta_train_idx
-                        meta_val_idx = saved_meta_val_idx
-                        base_pool = [idx for idx in horizon_indices if idx not in meta_train_idx and idx not in meta_val_idx]
-                        self.output_text.insert(tk.END, f"Používám uložené meta a validační indexy pro {horizon}.\n")
-                    else:
-                        if len(horizon_indices) >= 2:
-                            base_pool, meta_pool = train_test_split(
-                                horizon_indices, test_size=meta_fraction, random_state=seed
-                            )
-                        else:
-                            base_pool, meta_pool = horizon_indices, []
+                        X_train = X_scaled[train_idx]
+                        X_val = X_scaled[val_idx]
+                        y_train = y_values[train_idx]
+                        y_val = y_values[val_idx]
 
-                        if len(meta_pool) >= 2:
-                            meta_train_idx, meta_val_idx = train_test_split(
-                                meta_pool, test_size=val_split, random_state=seed
-                            )
-                        else:
-                            meta_train_idx, meta_val_idx = meta_pool, meta_pool
+                        meta_train = X_scaled[meta_train_idx] if len(meta_train_idx) > 0 else np.empty((0, X_scaled.shape[1]))
+                        meta_val = X_scaled[meta_val_idx] if len(meta_val_idx) > 0 else np.empty((0, X_scaled.shape[1]))
+                        meta_train_targets = y_values[meta_train_idx] if len(meta_train_idx) > 0 else np.empty((0, 1))
+                        meta_val_targets = y_values[meta_val_idx] if len(meta_val_idx) > 0 else np.empty((0, 1))
 
-                    # Validation split for primary model (disjoint from meta holdout)
-                    if saved_val_idx:
-                        val_idx = [idx for idx in saved_val_idx if idx in base_pool]
-                        if not val_idx:
-                            self.output_text.insert(tk.END, f"Varování: Uložené validační indexy pro {horizon} nejsou použitelné, provádím nový split.\n")
-                            train_idx, val_idx = train_test_split(
-                                base_pool, test_size=val_split, random_state=seed
-                            ) if len(base_pool) >= 2 else (base_pool, base_pool)
-                        else:
-                            train_idx = [idx for idx in base_pool if idx not in val_idx]
-                            self.output_text.insert(tk.END, f"Používám uložené validační indexy pro {horizon}.\n")
-                    else:
-                        if len(base_pool) >= 2:
-                            train_idx, val_idx = train_test_split(
-                                base_pool, test_size=val_split, random_state=seed
-                            )
-                        else:
-                            train_idx, val_idx = base_pool, base_pool
+                        fold_tasks.append(
+                            {
+                                'fold_id': fold_id,
+                                'X_train': torch.FloatTensor(X_train),
+                                'y_train': torch.FloatTensor(y_train),
+                                'X_val': torch.FloatTensor(X_val),
+                                'y_val': torch.FloatTensor(y_val),
+                                'meta_train_X': torch.FloatTensor(meta_train),
+                                'meta_val_X': torch.FloatTensor(meta_val),
+                                'meta_train_y': torch.FloatTensor(meta_train_targets),
+                                'meta_val_y': torch.FloatTensor(meta_val_targets),
+                            }
+                        )
 
-                    split_indices_to_save[horizon] = {
-                        'val': np.array(val_idx),
-                        'meta_train': np.array(meta_train_idx),
-                        'meta_val': np.array(meta_val_idx),
-                    }
-
-                    X_train = X_scaled[train_idx]
-                    X_val = X_scaled[val_idx]
-                    y_train = y_values[train_idx]
-                    y_val = y_values[val_idx]
-
-                    meta_train = X_scaled[meta_train_idx] if len(meta_train_idx) > 0 else np.empty((0, X_scaled.shape[1]))
-                    meta_val = X_scaled[meta_val_idx] if len(meta_val_idx) > 0 else np.empty((0, X_scaled.shape[1]))
-                    meta_train_targets = y_values[meta_train_idx] if len(meta_train_idx) > 0 else np.empty((0, 1))
-                    meta_val_targets = y_values[meta_val_idx] if len(meta_val_idx) > 0 else np.empty((0, 1))
-
+                    self.output_text.insert(tk.END, f"{horizon}: rolling split vytvořen s {len(fold_tasks)} foldy.\n")
                     target_tasks.append(
                         {
                             'horizon': horizon,
-                            'X_train': torch.FloatTensor(X_train),
-                            'y_train': torch.FloatTensor(y_train),
-                            'X_val': torch.FloatTensor(X_val),
-                            'y_val': torch.FloatTensor(y_val),
-                            'meta_train_X': torch.FloatTensor(meta_train),
-                            'meta_val_X': torch.FloatTensor(meta_val),
-                            'meta_train_y': torch.FloatTensor(meta_train_targets),
-                            'meta_val_y': torch.FloatTensor(meta_val_targets),
+                            'folds': fold_tasks,
                         }
                     )
 
@@ -1533,12 +1519,6 @@ class NeuralNetApp:
                     self.enable_buttons()
                     return
 
-                if split_indices_to_save:
-                    val_index_file = f"val_indices_{timestamp}.pkl"
-                    with open(val_index_file, "wb") as f:
-                        pickle.dump(split_indices_to_save, f)
-                    self.output_text.insert(tk.END, f"Validační a meta indexy uloženy do '{val_index_file}'.\n")
-
                 self.output_text.insert(
                     tk.END,
                     f"K tréninku připraveno {len(target_tasks)} horizontů: {', '.join(task['horizon'] for task in target_tasks)}\n",
@@ -1548,13 +1528,6 @@ class NeuralNetApp:
                 self.network_selector['values'] = network_ids
                 if network_ids:
                     self.network_selector.current(0)
-
-                pretrained_map = {}
-                if continue_training:
-                    for path in self.loaded_models:
-                        horizon = infer_horizon_from_filename(path)
-                        if horizon:
-                            pretrained_map[horizon] = path
 
                 params = {
                     'seed': seed,
@@ -1574,8 +1547,6 @@ class NeuralNetApp:
                     'learning_rate': learning_rate,
                     'timestamp': timestamp,
                     'target_tasks': target_tasks,
-                    'continue_training': continue_training,
-                    'pretrained_models': pretrained_map,
                 }
 
                 self.training_thread = TrainingThread(self, params)
