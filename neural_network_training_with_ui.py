@@ -429,9 +429,8 @@ class TrainingThread(threading.Thread):
                     f"\n--- Trénování horizontu {horizon} ({len(fold_tasks)} rolling foldů) ---"
                 )
 
-                best_fold = None
-                best_val_loss = float('inf')
-                best_entry = None
+                last_fold = None
+                last_entry = None
 
                 for fold_task in fold_tasks:
                     if self.stop_event.is_set():
@@ -480,21 +479,18 @@ class TrainingThread(threading.Thread):
                     if self.stop_event.is_set():
                         break
 
-                    fold_val = train_outcome.get('val_loss', float('inf'))
-                    if fold_val < best_val_loss:
-                        best_val_loss = fold_val
-                        best_fold = fold_id
-                        best_entry = train_outcome
+                    last_fold = fold_id
+                    last_entry = train_outcome
 
                 if self.stop_event.is_set():
                     break
 
-                if not best_entry:
+                if not last_entry:
                     self.app.thread_safe_logger.log(f"Varování: {horizon} nemá žádný úspěšný fold.")
                     continue
 
                 self.app.thread_safe_logger.log(
-                    f"Nejlepší fold pro {horizon}: {best_fold} (val_loss {best_val_loss:.6f})"
+                    f"Používám poslední fold pro {horizon}: {last_fold} (val_loss {last_entry.get('val_loss', float('inf')):.6f})"
                 )
 
                 if self.stop_event.is_set():
@@ -505,9 +501,9 @@ class TrainingThread(threading.Thread):
                         'timestamp': timestamp,
                         'model_type': 'resnet',
                         'horizon': horizon,
-                        'val_loss': best_entry.get('val_loss', float('inf')),
-                        'meta_val_loss': best_entry.get('meta_val_loss'),
-                        'best_fold': best_fold,
+                        'val_loss': last_entry.get('val_loss', float('inf')),
+                        'meta_val_loss': last_entry.get('meta_val_loss'),
+                        'best_fold': last_fold,
                         'epochs': epochs,
                         'batch_size': batch_size,
                         'learning_rate': learning_rate,
@@ -521,7 +517,7 @@ class TrainingThread(threading.Thread):
                         'seed': seed,
                     }
                 )
-                trained_models.append(best_entry)
+                trained_models.append(last_entry)
 
             if not self.stop_event.is_set():
                 self.app.thread_safe_logger.log(f"\n=== Trénink dokončen (ID: {timestamp}) ===")
