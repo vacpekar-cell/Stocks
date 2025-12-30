@@ -431,6 +431,8 @@ class TrainingThread(threading.Thread):
 
                 last_fold = None
                 last_entry = None
+                last_meta_fold = None
+                last_meta_entry = None
 
                 for fold_task in fold_tasks:
                     if self.stop_event.is_set():
@@ -481,6 +483,9 @@ class TrainingThread(threading.Thread):
 
                     last_fold = fold_id
                     last_entry = train_outcome
+                    if train_outcome.get('meta_state') is not None:
+                        last_meta_fold = fold_id
+                        last_meta_entry = train_outcome
 
                 if self.stop_event.is_set():
                     break
@@ -492,6 +497,15 @@ class TrainingThread(threading.Thread):
                 self.app.thread_safe_logger.log(
                     f"Používám poslední fold pro {horizon}: {last_fold} (val_loss {last_entry.get('val_loss', float('inf')):.6f})"
                 )
+                if last_meta_entry is not None:
+                    self.app.thread_safe_logger.log(
+                        f"Metasíť pro {horizon} beru z posledního foldu s meta: {last_meta_fold} "
+                        f"(meta_val_loss {last_meta_entry.get('meta_val_loss', float('inf')):.6f})"
+                    )
+                else:
+                    self.app.thread_safe_logger.log(
+                        f"Metasíť pro {horizon} nebyla v žádném foldu vytrénována."
+                    )
 
                 if self.stop_event.is_set():
                     break
@@ -502,7 +516,7 @@ class TrainingThread(threading.Thread):
                         'model_type': 'resnet',
                         'horizon': horizon,
                         'val_loss': last_entry.get('val_loss', float('inf')),
-                        'meta_val_loss': last_entry.get('meta_val_loss'),
+                        'meta_val_loss': (last_meta_entry or last_entry).get('meta_val_loss'),
                         'best_fold': last_fold,
                         'epochs': epochs,
                         'batch_size': batch_size,
@@ -517,7 +531,13 @@ class TrainingThread(threading.Thread):
                         'seed': seed,
                     }
                 )
-                trained_models.append(last_entry)
+                if last_meta_entry is not None and last_meta_entry is not last_entry:
+                    merged_entry = dict(last_entry)
+                    merged_entry['meta_state'] = last_meta_entry.get('meta_state')
+                    merged_entry['meta_val_loss'] = last_meta_entry.get('meta_val_loss')
+                    trained_models.append(merged_entry)
+                else:
+                    trained_models.append(last_entry)
 
             if not self.stop_event.is_set():
                 self.app.thread_safe_logger.log(f"\n=== Trénink dokončen (ID: {timestamp}) ===")
