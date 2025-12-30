@@ -497,18 +497,6 @@ class TrainingThread(threading.Thread):
                     f"Nejlepší fold pro {horizon}: {best_fold} (val_loss {best_val_loss:.6f})"
                 )
 
-                best_model_state = best_entry.get('model_state')
-                if best_model_state is not None:
-                    model_file = f"model_resnet_{horizon}_{timestamp}.pt"
-                    torch.save(best_model_state, model_file)
-                    self.app.thread_safe_logger.log(f"Uloženo nejlepší modelové váhy jako '{model_file}'")
-
-                best_meta_state = best_entry.get('meta_state')
-                if best_meta_state is not None:
-                    meta_file = f"meta_resnet_{horizon}_{timestamp}.pt"
-                    torch.save(best_meta_state, meta_file)
-                    self.app.thread_safe_logger.log(f"Uloženo nejlepší váhy metasítě jako '{meta_file}'")
-
                 if self.stop_event.is_set():
                     break
 
@@ -784,15 +772,11 @@ class TrainingThread(threading.Thread):
 
             logger.finish()
 
-            model_file = f"model_resnet_{file_tag}_{timestamp}.pt"
             model.load_state_dict(best_model_state)
             model.to(device)
             model.eval()
 
-            torch.save(best_model_state, model_file)
-
             self.app.thread_safe_logger.log(f"Síť {display_id} dokončena. Nejlepší validační ztráta: {best_val_loss:.6f}")
-            self.app.thread_safe_logger.log(f"Model uložen jako '{model_file}'")
 
             try:
                 if not run_meta or len(meta_train_X) == 0 or len(meta_val_X) == 0:
@@ -1007,11 +991,6 @@ class TrainingThread(threading.Thread):
                 meta_model.load_state_dict(best_state)
 
             logger.finish()
-
-            file_tag = file_tag or network_id
-            meta_model_file = f"meta_resnet_{file_tag}_{timestamp}.pt"
-            torch.save(meta_model.state_dict(), meta_model_file)
-            self.app.thread_safe_logger.log(f"Metasíť uložena jako '{meta_model_file}'")
 
             del base_model, meta_model, optimizer, criterion
             if scaler is not None:
@@ -1285,13 +1264,38 @@ class NeuralNetApp:
     def load_models(self):
         model_files = filedialog.askopenfilenames(filetypes=[("PyTorch model", "*.pt"), ("Všechny soubory", "*.*")])
         if model_files:
-            self.loaded_models = list(model_files)
-            self.loaded_models_var.set(f"Načteno {len(self.loaded_models)} modelů")
-            self.output_text.insert(tk.END, f"Načteno {len(self.loaded_models)} modelů.\n")
-            
-            # Vypíše načtené modely
-            for i, model in enumerate(self.loaded_models):
-                self.output_text.insert(tk.END, f"  {i+1}: {os.path.basename(model)}\n")
+            bundle_files = []
+            skipped = []
+            for path in model_files:
+                try:
+                    obj = torch.load(path, map_location='cpu')
+                except Exception:
+                    skipped.append(path)
+                    continue
+                if isinstance(obj, dict) and obj.get('bundle_type') == 'training_bundle':
+                    bundle_files.append(path)
+                else:
+                    skipped.append(path)
+
+            if not bundle_files:
+                self.loaded_models = []
+                self.loaded_models_var.set("Žádné bundle modely načteny")
+                self.output_text.insert(
+                    tk.END,
+                    "Nebyl nalezen žádný bundle modelů. Nahrajte soubor models_bundle_<timestamp>.pt.\n",
+                )
+            else:
+                self.loaded_models = bundle_files
+                self.loaded_models_var.set(f"Načteno {len(self.loaded_models)} bundle modelů")
+                self.output_text.insert(tk.END, f"Načteno {len(self.loaded_models)} bundle modelů.\n")
+                for i, model in enumerate(self.loaded_models):
+                    self.output_text.insert(tk.END, f"  {i+1}: {os.path.basename(model)}\n")
+
+            if skipped:
+                self.output_text.insert(
+                    tk.END,
+                    f"Přeskočeno {len(skipped)} souborů, které nejsou bundle modely.\n",
+                )
                 
         else:
             self.loaded_models = []
@@ -1592,14 +1596,14 @@ class NeuralNetApp:
             if self.loaded_models:
                 models_to_use = self.loaded_models
                 if len(models_to_use) > 1:
-                    self.output_text.insert(tk.END, "Načteno více modelů, pro simulace bude použit první.\n")
+                    self.output_text.insert(tk.END, "Načteno více bundle modelů, pro predikci bude použit první.\n")
                 else:
-                    self.output_text.insert(tk.END, "Používám načtený model.\n")
+                    self.output_text.insert(tk.END, "Používám načtený bundle model.\n")
             elif specific_model_path and os.path.exists(specific_model_path):
                 models_to_use = [specific_model_path]
-                self.output_text.insert(tk.END, f"Používám konkrétní model: {specific_model_path}\n")
+                self.output_text.insert(tk.END, f"Používám konkrétní bundle model: {specific_model_path}\n")
             else:
-                messagebox.showerror("Chyba", "Nejsou načteny žádné modely ani vybrán konkrétní model!")
+                messagebox.showerror("Chyba", "Nejsou načteny žádné bundle modely ani vybrán konkrétní soubor!")
                 return
 
             scaler_files = [f for f in os.listdir('.') if f.startswith('scaler_') and f.endswith('.pkl')]
@@ -1670,24 +1674,22 @@ class NeuralNetApp:
 
                 bundle_timestamp = None
                 effective_use_sigmoid = self.use_sigmoid.get()
-                bundle = None
-                if len(models_to_use) == 1:
-                    bundle = load_bundle(models_to_use[0])
+                if len(models_to_use) != 1:
+                    messagebox.showerror("Chyba", "Pro predikci lze použít pouze jeden bundle model.")
+                    return
 
-                if bundle:
-                    bundle_timestamp = bundle.get('timestamp') or infer_timestamp_from_model(models_to_use[0])
-                    effective_use_sigmoid = bundle.get('use_sigmoid', effective_use_sigmoid)
-                    for horizon, payload in bundle.get('models', {}).items():
-                        horizon_models[horizon] = payload.get('model_state') or payload
-                        if payload.get('meta_state') is not None:
-                            meta_model_states[horizon] = payload['meta_state']
-                    self.output_text.insert(tk.END, f"Načten bundle modelů s {len(horizon_models)} sítěmi.\n")
-                else:
-                    for path in models_to_use:
-                        horizon = infer_horizon_from_filename(path)
-                        if horizon:
-                            horizon_models[horizon] = path
-                    effective_use_sigmoid = self.use_sigmoid.get()
+                bundle = load_bundle(models_to_use[0])
+                if not bundle:
+                    messagebox.showerror("Chyba", "Vybraný soubor není bundle modelů (models_bundle_<timestamp>.pt).")
+                    return
+
+                bundle_timestamp = bundle.get('timestamp') or infer_timestamp_from_model(models_to_use[0])
+                effective_use_sigmoid = bundle.get('use_sigmoid', effective_use_sigmoid)
+                for horizon, payload in bundle.get('models', {}).items():
+                    horizon_models[horizon] = payload.get('model_state') or payload
+                    if payload.get('meta_state') is not None:
+                        meta_model_states[horizon] = payload['meta_state']
+                self.output_text.insert(tk.END, f"Načten bundle modelů s {len(horizon_models)} sítěmi.\n")
 
                 num_rows = X_predict_tensor.shape[0]
 
@@ -1730,21 +1732,6 @@ class NeuralNetApp:
                     stacked = torch.cat(pass_predictions)
                     return inverse_target_transform(stacked).cpu().numpy()
 
-                def find_meta_model_path(base_model_path, horizon: str | None, timestamp_hint: str | None = None):
-                    timestamp = infer_timestamp_from_model(base_model_path) if isinstance(base_model_path, str) else timestamp_hint
-                    if horizon is None or timestamp is None:
-                        return None
-
-                    candidate = f"meta_resnet_{horizon}_{timestamp}.pt"
-                    base_dir = (os.path.dirname(base_model_path) or ".") if isinstance(base_model_path, str) else "."
-                    full_candidate = os.path.join(base_dir, candidate)
-
-                    if os.path.exists(full_candidate):
-                        return full_candidate
-                    if os.path.exists(candidate):
-                        return candidate
-                    return None
-
                 def predict_meta_errors(meta_model_path, base_predictions: np.ndarray) -> np.ndarray:
                     state_dict = torch.load(meta_model_path, map_location='cpu') if isinstance(meta_model_path, str) else meta_model_path
                     meta_model = ErrorEstimator(
@@ -1781,50 +1768,20 @@ class NeuralNetApp:
                     return torch.cat(meta_preds).numpy().reshape(-1)
 
                 results = {}
+                used_horizons = [h for h in HORIZON_ORDER if h in horizon_models]
+                for horizon in used_horizons:
+                    mean_preds = predict_with_model(horizon_models[horizon], 1).reshape(-1)
+                    results[f"mean_{horizon}"] = mean_preds
 
-                if horizon_models:
-                    used_horizons = [h for h in HORIZON_ORDER if h in horizon_models]
-                    for horizon in used_horizons:
-                        mean_preds = predict_with_model(horizon_models[horizon], 1).reshape(-1)
-                        results[f"mean_{horizon}"] = mean_preds
-
-                        meta_state = meta_model_states.get(horizon)
-                        meta_model_path = find_meta_model_path(horizon_models[horizon], horizon, bundle_timestamp) if meta_state is None else None
-                        if meta_state is not None:
-                            results[f"error_{horizon}"] = predict_meta_errors(meta_state, mean_preds)
-                        elif meta_model_path:
-                            results[f"error_{horizon}"] = predict_meta_errors(meta_model_path, mean_preds)
-                        else:
-                            self.output_text.insert(
-                                tk.END,
-                                f"Nebyl nalezen meta-model pro horizont {horizon}, odhady chyby budou NaN.\n",
-                            )
-                            results[f"error_{horizon}"] = np.full_like(mean_preds, np.nan, dtype=float)
-                else:
-                    fallback_model = models_to_use[0]
-                    mean_preds = predict_with_model(fallback_model, 1)
-                    output_dim = mean_preds.shape[1] if mean_preds.ndim == 2 else 1
-                    horizons = HORIZON_ORDER[:output_dim]
-
-                    if mean_preds.ndim == 1:
-                        mean_preds = mean_preds.reshape(-1, 1)
-
-                    for j, horizon in enumerate(horizons):
-                        horizon_preds = mean_preds[:, j]
-                        results[f"mean_{horizon}"] = horizon_preds
-
-                        meta_state = meta_model_states.get(horizon)
-                        base_meta_path = find_meta_model_path(fallback_model, horizon, bundle_timestamp) if meta_state is None else None
-                        if meta_state is not None:
-                            results[f"error_{horizon}"] = predict_meta_errors(meta_state, horizon_preds)
-                        elif base_meta_path:
-                            results[f"error_{horizon}"] = predict_meta_errors(base_meta_path, horizon_preds)
-                        else:
-                            self.output_text.insert(
-                                tk.END,
-                                f"Nebyl nalezen meta-model pro horizont {horizon}, odhady chyby budou NaN.\n",
-                            )
-                            results[f"error_{horizon}"] = np.full_like(horizon_preds, np.nan, dtype=float)
+                    meta_state = meta_model_states.get(horizon)
+                    if meta_state is not None:
+                        results[f"error_{horizon}"] = predict_meta_errors(meta_state, mean_preds)
+                    else:
+                        self.output_text.insert(
+                            tk.END,
+                            f"Nebyl nalezen meta-model pro horizont {horizon}, odhady chyby budou NaN.\n",
+                        )
+                        results[f"error_{horizon}"] = np.full_like(mean_preds, np.nan, dtype=float)
 
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
 
