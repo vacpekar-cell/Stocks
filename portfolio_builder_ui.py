@@ -1,5 +1,4 @@
 import datetime as dt
-import itertools
 import os
 import sys
 import threading
@@ -42,6 +41,10 @@ def _safe_covariance_matrix(stds: np.ndarray, corr: np.ndarray) -> np.ndarray:
     # Ensure diagonals are 1 for correlation and guard against NaNs
     np.fill_diagonal(corr, 1.0)
     corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Simple shrinkage towards identity to stabilize covariance estimates
+    shrink = 0.1
+    corr = (1 - shrink) * corr + shrink * np.eye(len(corr))
 
     stds = np.asarray(stds).reshape(-1, 1)
     cov = corr * (stds @ stds.T)
@@ -326,13 +329,8 @@ class PortfolioBuilder:
             self.log("Seznam akcií je prázdný.")
             return [], np.array([]), 0.0
 
-        exhaustive_portfolio = self._exhaustive_equal_weight_search()
-        if exhaustive_portfolio:
-            portfolio = exhaustive_portfolio
-            self.log(
-                f"Startuji z nejlepší kombinace s equal weight ({len(portfolio)} pozic)."
-            )
-        else:
+        portfolio = self._optimize_sparse_portfolio()
+        if not portfolio:
             portfolio = [self.records[0]]
             self.log(f"1) Přidávám {portfolio[0].ticker} s nejvyšším Sharpe {portfolio[0].sharpe:.3f}.")
 
@@ -478,51 +476,87 @@ class PortfolioBuilder:
 
         return portfolio, final_weights if 'final_weights' in locals() else np.array([]), final_sharpe if 'final_sharpe' in locals() else 0.0
 
-    def _exhaustive_equal_weight_search(self) -> list[StockRecord]:
-        """Try all combinations with equal weights for a limited candidate set."""
+    def _optimize_sparse_portfolio(self) -> list[StockRecord]:
+        """Greedy + swap search for a sparse Markowitz-style portfolio."""
         if self._should_stop():
             return []
 
-        max_candidates = 12
-        max_evaluations = 5000
-        candidates = self.records[:max_candidates]
-        if len(candidates) < 2:
-            return []
+        pool_size = min(150, len(self.records))
+        pool = self.records[:pool_size]
+        tickers = [r.ticker for r in pool]
+        self.log(f"Používám kandidátní pool {pool_size} akcií s pozitivním Sharpe.")
 
-        target_size = min(self.max_positions, len(candidates))
-        if target_size < 2:
-            return []
+        corr_pool = build_correlation_matrix(tickers, self.cache, self.log)
+        expected_pool = np.array([r.forecast_pct for r in pool])
+        stds_pool = np.array([r.std_pct for r in pool])
 
-        self.log(
-            f"Zkouším kombinace s equal weight pro top {len(candidates)} akcií (max {max_evaluations} kombinací)."
-        )
+        def submatrix(indices: list[int]) -> np.ndarray:
+            idx = np.array(indices, dtype=int)
+            return corr_pool[np.ix_(idx, idx)]
 
-        best_combo: list[StockRecord] = []
-        best_sharpe = -np.inf
-        evaluations = 0
+        def score(indices: list[int]) -> tuple[float, np.ndarray]:
+            corr = submatrix(indices)
+            expected = expected_pool[indices]
+            stds = stds_pool[indices]
+            weights = optimize_weights(expected, corr, stds, self.max_weight)
+            sharpe = portfolio_sharpe(weights, expected, corr, stds)
+            return sharpe, weights
 
-        for size in range(2, target_size + 1):
-            for combo in itertools.combinations(candidates, size):
+        # Greedy forward selection
+        target_size = min(self.max_positions, len(pool))
+        selected = [0]
+        best_sharpe, _ = score(selected)
+        self.log(f"Greedy start: {pool[0].ticker}, Sharpe {best_sharpe:.3f}")
+
+        while len(selected) < target_size:
+            if self._should_stop():
+                return [pool[i] for i in selected]
+            best_candidate = None
+            best_candidate_sharpe = best_sharpe
+            for idx in range(len(pool)):
+                if idx in selected:
+                    continue
+                trial = selected + [idx]
+                sharpe, _ = score(trial)
+                if sharpe > best_candidate_sharpe:
+                    best_candidate_sharpe = sharpe
+                    best_candidate = idx
+            if best_candidate is None:
+                break
+            selected.append(best_candidate)
+            best_sharpe = best_candidate_sharpe
+            self.log(f"Greedy přidávám {pool[best_candidate].ticker}, Sharpe {best_sharpe:.3f}")
+
+        # Local swap search
+        max_passes = 4
+        for _ in range(max_passes):
+            if self._should_stop():
+                break
+            improved = False
+            for i, idx_out in enumerate(list(selected)):
                 if self._should_stop():
-                    return best_combo
-                evaluations += 1
-                if evaluations > max_evaluations:
-                    self.log("Limit kombinací dosažen, pokračuji s nejlepší nalezenou kombinací.")
-                    return best_combo
+                    break
+                for idx_in in range(len(pool)):
+                    if idx_in in selected:
+                        continue
+                    trial = selected.copy()
+                    trial[i] = idx_in
+                    sharpe, _ = score(trial)
+                    if sharpe > best_sharpe + 1e-6:
+                        selected = trial
+                        best_sharpe = sharpe
+                        improved = True
+                        self.log(
+                            f"Swap vylepšil Sharpe na {best_sharpe:.3f} "
+                            f"({pool[idx_out].ticker} -> {pool[idx_in].ticker})."
+                        )
+                        break
+                if improved:
+                    break
+            if not improved:
+                break
 
-                tickers = [r.ticker for r in combo]
-                corr = build_correlation_matrix(tickers, self.cache, self.log)
-                expected = np.array([r.forecast_pct for r in combo])
-                stds = np.array([r.std_pct for r in combo])
-                weights = np.ones(len(combo)) / len(combo)
-                sharpe = portfolio_sharpe(weights, expected, corr, stds)
-                if sharpe > best_sharpe:
-                    best_sharpe = sharpe
-                    best_combo = list(combo)
-
-        if best_combo:
-            self.log(f"Nejlepší equal weight kombinace Sharpe {best_sharpe:.3f}.")
-        return best_combo
+        return [pool[i] for i in selected]
 
     def _prune_and_polish_final(
         self, portfolio: list[StockRecord], weights: np.ndarray, sharpe: float
