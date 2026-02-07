@@ -1,4 +1,5 @@
 import datetime as dt
+import itertools
 import os
 import sys
 import threading
@@ -315,12 +316,25 @@ class PortfolioBuilder:
         return False
 
     def build(self) -> tuple[list[StockRecord], np.ndarray, float]:
+        positive_records = [r for r in self.records if r.sharpe > 0]
+        if not positive_records:
+            self.log("Žádné akcie s pozitivním Sharpe ratio, nemohu sestavit portfolio.")
+            return [], np.array([]), 0.0
+
+        self.records = positive_records
         if not self.records:
             self.log("Seznam akcií je prázdný.")
             return [], np.array([]), 0.0
 
-        portfolio: list[StockRecord] = [self.records[0]]
-        self.log(f"1) Přidávám {portfolio[0].ticker} s nejvyšším Sharpe {portfolio[0].sharpe:.3f}.")
+        exhaustive_portfolio = self._exhaustive_equal_weight_search()
+        if exhaustive_portfolio:
+            portfolio = exhaustive_portfolio
+            self.log(
+                f"Startuji z nejlepší kombinace s equal weight ({len(portfolio)} pozic)."
+            )
+        else:
+            portfolio = [self.records[0]]
+            self.log(f"1) Přidávám {portfolio[0].ticker} s nejvyšším Sharpe {portfolio[0].sharpe:.3f}.")
 
         while len(portfolio) < min(self.max_positions, len(self.records)):
             if self._should_stop():
@@ -463,6 +477,52 @@ class PortfolioBuilder:
             final_weights = final_weights[order]
 
         return portfolio, final_weights if 'final_weights' in locals() else np.array([]), final_sharpe if 'final_sharpe' in locals() else 0.0
+
+    def _exhaustive_equal_weight_search(self) -> list[StockRecord]:
+        """Try all combinations with equal weights for a limited candidate set."""
+        if self._should_stop():
+            return []
+
+        max_candidates = 12
+        max_evaluations = 5000
+        candidates = self.records[:max_candidates]
+        if len(candidates) < 2:
+            return []
+
+        target_size = min(self.max_positions, len(candidates))
+        if target_size < 2:
+            return []
+
+        self.log(
+            f"Zkouším kombinace s equal weight pro top {len(candidates)} akcií (max {max_evaluations} kombinací)."
+        )
+
+        best_combo: list[StockRecord] = []
+        best_sharpe = -np.inf
+        evaluations = 0
+
+        for size in range(2, target_size + 1):
+            for combo in itertools.combinations(candidates, size):
+                if self._should_stop():
+                    return best_combo
+                evaluations += 1
+                if evaluations > max_evaluations:
+                    self.log("Limit kombinací dosažen, pokračuji s nejlepší nalezenou kombinací.")
+                    return best_combo
+
+                tickers = [r.ticker for r in combo]
+                corr = build_correlation_matrix(tickers, self.cache, self.log)
+                expected = np.array([r.forecast_pct for r in combo])
+                stds = np.array([r.std_pct for r in combo])
+                weights = np.ones(len(combo)) / len(combo)
+                sharpe = portfolio_sharpe(weights, expected, corr, stds)
+                if sharpe > best_sharpe:
+                    best_sharpe = sharpe
+                    best_combo = list(combo)
+
+        if best_combo:
+            self.log(f"Nejlepší equal weight kombinace Sharpe {best_sharpe:.3f}.")
+        return best_combo
 
     def _prune_and_polish_final(
         self, portfolio: list[StockRecord], weights: np.ndarray, sharpe: float
