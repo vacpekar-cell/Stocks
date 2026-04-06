@@ -195,11 +195,12 @@ def compute_portfolio_curve(prices: pd.DataFrame, portfolio: PortfolioDefinition
     p = prices.loc[prices.index >= portfolio.start_date, portfolio.tickers].copy()
     p = p.dropna(how="all").ffill().dropna(how="any")
     if p.empty:
-        raise ValueError(f"Chybí data pro {portfolio.name} od {portfolio.start_date.date()}.")
+        # Typical for newest portfolio when less than one trading week elapsed.
+        return pd.Series([1.0], index=[portfolio.start_date], name=portfolio.name)
 
     weekly = p.resample("W-FRI").last().dropna(how="any")
     if weekly.empty:
-        raise ValueError(f"Po převodu na týdenní data nejsou data pro {portfolio.name}.")
+        return pd.Series([1.0], index=[portfolio.start_date], name=portfolio.name)
 
     base = weekly.iloc[0]
     rel = weekly.divide(base)
