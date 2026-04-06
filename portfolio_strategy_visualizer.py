@@ -209,49 +209,71 @@ def compute_portfolio_curve(prices: pd.DataFrame, portfolio: PortfolioDefinition
     return curve
 
 
+def _rebalanced_average_from_level_matrix(levels: pd.DataFrame, name: str) -> pd.Series:
+    """
+    Compute dynamic equal-weight portfolio from level curves:
+    - each step uses mean return of portfolios with both t-1 and t values,
+    - capital is rebalanced equally among available portfolios each step.
+    """
+    if levels.empty:
+        return pd.Series(dtype=float, name=name)
+
+    step_returns = pd.Series(index=levels.index, dtype=float)
+    step_returns.iloc[0] = 1.0
+
+    for i in range(1, len(levels.index)):
+        prev_row = levels.iloc[i - 1]
+        curr_row = levels.iloc[i]
+        valid = prev_row.notna() & curr_row.notna() & (prev_row > 0)
+        if valid.any():
+            r = (curr_row[valid] / prev_row[valid]).mean()
+            step_returns.iloc[i] = float(r)
+        else:
+            step_returns.iloc[i] = 1.0
+
+    portfolio = step_returns.cumprod()
+    portfolio.name = name
+    return portfolio
+
+
 def aggregate_live_portfolios(curves: Dict[str, pd.Series]) -> pd.Series:
     union_index = sorted(set().union(*[c.index for c in curves.values()]))
     matrix = pd.DataFrame(index=union_index)
     for name, curve in curves.items():
         matrix[name] = curve.reindex(union_index)
-    return matrix.mean(axis=1, skipna=True).rename("Celkové portfolio (průměr)")
+    return _rebalanced_average_from_level_matrix(matrix, "Celkové portfolio (rebalancovaný průměr)")
 
 
 def aggregate_aligned_portfolios(curves: Dict[str, pd.Series]) -> pd.Series:
     aligned = []
     for curve in curves.values():
         weeks = np.arange(len(curve))
-        aligned.append(pd.Series(curve.values, index=weeks))
+        aligned.append(pd.Series(curve.values, index=weeks, name=curve.name))
     aligned_df = pd.concat(aligned, axis=1)
-    return aligned_df.mean(axis=1).rename("Virtuální portfolio (průměr)")
+    return _rebalanced_average_from_level_matrix(aligned_df, "Virtuální portfolio (rebalancovaný průměr)")
 
 
-def fit_exponential_growth(curves: Dict[str, pd.Series]) -> Tuple[pd.Series, float]:
+def fit_exponential_growth(reference_curve: pd.Series) -> Tuple[pd.Series, float]:
     """
-    Fit y = a * exp(b * t) across all aligned points from all portfolios.
+    Fit y = a * exp(b * t) on a reference curve.
     Returns fitted curve on integer weeks and annualized growth rate in decimals.
     """
-    points = []
-    max_week = 0
+    if reference_curve.empty:
+        raise ValueError("Nelze spočítat exponenciální fit: referenční křivka je prázdná.")
 
-    for curve in curves.values():
-        t = np.arange(len(curve))
-        y = curve.values
-        valid = np.isfinite(y) & (y > 0)
-        t = t[valid]
-        y = y[valid]
-        if len(y) > 0:
-            points.append(pd.DataFrame({"t": t, "y": y}))
-            max_week = max(max_week, int(t.max()))
+    x = np.arange(len(reference_curve), dtype=float)
+    y = reference_curve.values.astype(float)
+    valid = np.isfinite(y) & (y > 0)
+    x = x[valid]
+    y = y[valid]
+    if len(y) < 2:
+        raise ValueError("Nelze spočítat exponenciální fit: potřebuji alespoň 2 validní body.")
 
-    if not points:
-        raise ValueError("Nelze spočítat exponenciální fit: chybí validní body > 0.")
-
-    all_points = pd.concat(points, ignore_index=True)
     # log(y) = log(a) + b*t
-    b, log_a = np.polyfit(all_points["t"].values, np.log(all_points["y"].values), 1)
+    b, log_a = np.polyfit(x, np.log(y), 1)
     a = float(np.exp(log_a))
 
+    max_week = int(x.max())
     fit_x = np.linspace(0, max_week, max(200, max_week * 10 + 1))
     fit_y = a * np.exp(b * fit_x)
     annual_growth = float(np.exp(b * 52) - 1.0)
@@ -373,7 +395,7 @@ def run_analysis(
 
     combined_live = aggregate_live_portfolios(curves)
     combined_aligned = aggregate_aligned_portfolios(curves)
-    exp_fit, annual_growth_rate = fit_exponential_growth(curves)
+    exp_fit, annual_growth_rate = fit_exponential_growth(combined_aligned)
 
     sp = benchmark_prices.loc[benchmark_prices.index >= start]
     sp_weekly = sp.resample("W-FRI").last().dropna()
