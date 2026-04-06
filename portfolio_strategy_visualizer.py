@@ -3,7 +3,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -35,10 +35,57 @@ def parse_reference_date(path: Path) -> pd.Timestamp:
     return pd.Timestamp(datetime.strptime(match.group(1), "%d.%m.%Y").date())
 
 
+def resolve_latest_input_file(explicit_path: Optional[Path] = None) -> Path:
+    """
+    Resolve input workbook.
+    - If explicit path is provided, use it.
+    - Otherwise, find the newest file by date in filename DD.MM.YYYY among *.xlsx in CWD.
+    """
+    if explicit_path is not None:
+        if not explicit_path.exists():
+            raise FileNotFoundError(f"Soubor neexistuje: {explicit_path}")
+        return explicit_path
+
+    candidates = list(Path(".").glob("*.xlsx"))
+    dated: List[Tuple[pd.Timestamp, Path]] = []
+    for path in candidates:
+        try:
+            dt = parse_reference_date(path)
+            dated.append((dt, path))
+        except ValueError:
+            continue
+
+    if not dated:
+        raise FileNotFoundError(
+            "Nebyl nalezen žádný .xlsx soubor s datem ve jméně (DD.MM.YYYY)."
+        )
+
+    dated.sort(key=lambda x: x[0])
+    return dated[-1][1]
+
+
+def resolve_sheet_name_case_insensitive(excel_path: Path, requested_name: str) -> str:
+    """Resolve sheet name in case-insensitive mode."""
+    xls = pd.ExcelFile(excel_path)
+    names = xls.sheet_names
+    if requested_name in names:
+        return requested_name
+
+    lowered_map = {name.lower(): name for name in names}
+    matched = lowered_map.get(requested_name.lower())
+    if matched:
+        return matched
+
+    raise ValueError(
+        f"Worksheet '{requested_name}' nebyl nalezen. Dostupné listy: {', '.join(names)}"
+    )
+
+
 def load_portfolios_from_sheet(
     excel_path: Path, sheet_name: str, rows: int = 10, col_step: int = 6
 ) -> List[PortfolioDefinition]:
-    df = pd.read_excel(excel_path, sheet_name=sheet_name, header=None)
+    resolved_sheet = resolve_sheet_name_case_insensitive(excel_path, sheet_name)
+    df = pd.read_excel(excel_path, sheet_name=resolved_sheet, header=None)
 
     start_col = 1  # B
     portfolios_raw: List[Dict] = []
@@ -152,11 +199,46 @@ def aggregate_aligned_portfolios(curves: Dict[str, pd.Series]) -> pd.Series:
     return aligned_df.mean(axis=1).rename("Virtuální portfolio (průměr)")
 
 
+def fit_exponential_growth(curves: Dict[str, pd.Series]) -> Tuple[pd.Series, float]:
+    """
+    Fit y = a * exp(b * t) across all aligned points from all portfolios.
+    Returns fitted curve on integer weeks and annualized growth rate in decimals.
+    """
+    points = []
+    max_week = 0
+
+    for curve in curves.values():
+        t = np.arange(len(curve))
+        y = curve.values
+        valid = np.isfinite(y) & (y > 0)
+        t = t[valid]
+        y = y[valid]
+        if len(y) > 0:
+            points.append(pd.DataFrame({"t": t, "y": y}))
+            max_week = max(max_week, int(t.max()))
+
+    if not points:
+        raise ValueError("Nelze spočítat exponenciální fit: chybí validní body > 0.")
+
+    all_points = pd.concat(points, ignore_index=True)
+    # log(y) = log(a) + b*t
+    b, log_a = np.polyfit(all_points["t"].values, np.log(all_points["y"].values), 1)
+    a = float(np.exp(log_a))
+
+    fit_x = np.arange(max_week + 1)
+    fit_y = a * np.exp(b * fit_x)
+    annual_growth = float(np.exp(b * 52) - 1.0)
+
+    return pd.Series(fit_y, index=fit_x, name="Exponenciální fit"), annual_growth
+
+
 def plot_results(
     curves: Dict[str, pd.Series],
     combined_live: pd.Series,
     sp500_curve: pd.Series,
     combined_aligned: pd.Series,
+    exp_fit: pd.Series,
+    annual_growth_rate: float,
     output_dir: Path,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +280,14 @@ def plot_results(
         color="black",
         linewidth=2.8,
         label=combined_aligned.name,
+    )
+    ax2.plot(
+        exp_fit.index,
+        exp_fit.values,
+        color="tab:red",
+        linestyle=":",
+        linewidth=2.5,
+        label=f"Exponenciální fit (CAGR ~ {annual_growth_rate * 100:.2f} % p.a.)",
     )
     ax2.set_title("Portfolia přenesená do společného začátku")
     ax2.set_xlabel("Počet týdnů od startu")
@@ -241,7 +331,7 @@ def main() -> None:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("03.04.2025 108nodes new meta.xlsx"),
+        default=None,
         help="Cesta k .xlsx souboru s portfolii",
     )
     parser.add_argument(
@@ -265,7 +355,10 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    portfolios = load_portfolios_from_sheet(args.input, args.sheet)
+    input_file = resolve_latest_input_file(args.input)
+    print(f"Použitý vstupní soubor: {input_file}")
+
+    portfolios = load_portfolios_from_sheet(input_file, args.sheet)
     all_tickers = sorted(set(sum([p.tickers for p in portfolios], [])))
 
     start = min(p.start_date for p in portfolios)
@@ -280,12 +373,22 @@ def main() -> None:
 
     combined_live = aggregate_live_portfolios(curves)
     combined_aligned = aggregate_aligned_portfolios(curves)
+    exp_fit, annual_growth_rate = fit_exponential_growth(curves)
 
     sp = benchmark_prices.loc[benchmark_prices.index >= start]
     sp_weekly = sp.resample("W-FRI").last().dropna()
     sp500_curve = (sp_weekly / sp_weekly.iloc[0]).iloc[:, 0].rename("S&P 500")
 
-    plot_results(curves, combined_live, sp500_curve, combined_aligned, args.output_dir)
+    plot_results(
+        curves,
+        combined_live,
+        sp500_curve,
+        combined_aligned,
+        exp_fit,
+        annual_growth_rate,
+        args.output_dir,
+    )
+    print(f"Odhadnutá roční rychlost růstu z exponenciálního fitu: {annual_growth_rate * 100:.2f} % p.a.")
 
 
 if __name__ == "__main__":
