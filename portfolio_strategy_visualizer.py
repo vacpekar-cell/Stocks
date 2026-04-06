@@ -35,7 +35,31 @@ def parse_reference_date(path: Path) -> pd.Timestamp:
     return pd.Timestamp(datetime.strptime(match.group(1), "%d.%m.%Y").date())
 
 
-def resolve_latest_input_file(explicit_path: Optional[Path] = None) -> Path:
+def _sheet_exists_case_insensitive(excel_path: Path, requested_name: str) -> bool:
+    xls = pd.ExcelFile(excel_path)
+    names = xls.sheet_names
+    return requested_name in names or requested_name.lower() in {n.lower() for n in names}
+
+
+def _looks_like_portfolio_layout(excel_path: Path, sheet_name: str) -> bool:
+    """
+    Lightweight validation that the selected sheet likely follows expected layout:
+    at least one non-empty ticker in column B and one numeric weight in column C.
+    """
+    resolved = resolve_sheet_name_case_insensitive(excel_path, sheet_name)
+    df = pd.read_excel(excel_path, sheet_name=resolved, header=None, nrows=10)
+    if df.shape[1] < 3:
+        return False
+
+    tickers = df.iloc[:10, 1].dropna().astype(str).str.strip()
+    weights = pd.to_numeric(df.iloc[:10, 2], errors="coerce").dropna()
+    return (tickers != "").any() and len(weights) > 0
+
+
+def resolve_latest_input_file(
+    explicit_path: Optional[Path] = None,
+    preferred_sheet: str = "Sheet1",
+) -> Path:
     """
     Resolve input workbook.
     - If explicit path is provided, use it.
@@ -47,21 +71,26 @@ def resolve_latest_input_file(explicit_path: Optional[Path] = None) -> Path:
         return explicit_path
 
     candidates = list(Path(".").glob("*.xlsx"))
-    dated: List[Tuple[pd.Timestamp, Path]] = []
+    valid_candidates: List[Tuple[float, Path]] = []
     for path in candidates:
         try:
-            dt = parse_reference_date(path)
-            dated.append((dt, path))
-        except ValueError:
+            parse_reference_date(path)  # keep only files from expected weekly series
+            if _sheet_exists_case_insensitive(path, preferred_sheet) and _looks_like_portfolio_layout(
+                path, preferred_sheet
+            ):
+                valid_candidates.append((path.stat().st_mtime, path))
+        except Exception:
+            # Ignore files from other workflows or with incompatible format
             continue
 
-    if not dated:
+    if not valid_candidates:
         raise FileNotFoundError(
-            "Nebyl nalezen žádný .xlsx soubor s datem ve jméně (DD.MM.YYYY)."
+            "Nebyl nalezen žádný validní .xlsx soubor se Sheet1 (nebo sheet1) a očekávaným rozložením portfolia. "
+            "Zadejte soubor ručně přes --input."
         )
 
-    dated.sort(key=lambda x: x[0])
-    return dated[-1][1]
+    valid_candidates.sort(key=lambda x: x[0])
+    return valid_candidates[-1][1]
 
 
 def resolve_sheet_name_case_insensitive(excel_path: Path, requested_name: str) -> str:
@@ -337,7 +366,7 @@ def main() -> None:
     parser.add_argument(
         "--sheet",
         type=str,
-        default="sheet1",
+        default="Sheet1",
         help="Název listu s portfolii",
     )
     parser.add_argument(
@@ -355,7 +384,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    input_file = resolve_latest_input_file(args.input)
+    input_file = resolve_latest_input_file(args.input, preferred_sheet=args.sheet)
     print(f"Použitý vstupní soubor: {input_file}")
 
     portfolios = load_portfolios_from_sheet(input_file, args.sheet)
