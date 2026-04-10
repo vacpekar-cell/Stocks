@@ -5,7 +5,6 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
 import pickle
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -13,6 +12,7 @@ import os
 import gc
 import time
 import warnings
+import re
 import threading
 import queue
 import matplotlib.pyplot as plt
@@ -139,12 +139,45 @@ class EfficientResNet(nn.Module):
         return x
 
 
+class ErrorEstimator(nn.Module):
+    """Predict the absolute error of the primary model for a given horizon."""
+
+    def __init__(self, input_dim, hidden_dims=None, dropout_rate=0.1):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = scaled_hidden_dims(input_dim)
+
+        self.backbone = EfficientResNet(
+            input_dim,
+            hidden_dims=hidden_dims,
+            dropout_rate=dropout_rate,
+            use_sigmoid=False,
+            output_dim=1,
+        )
+
+    def forward(self, x):
+        raw = self.backbone(x)
+        return F.softplus(raw)
+
+
 def scaled_hidden_dims(input_dim: int) -> list[int]:
     base_input = 66
     base_dims = [512, 256, 128, 64]
     ratio = input_dim / base_input
     scaled = [max(32, int(round(dim * ratio))) for dim in base_dims]
     return scaled
+
+
+def inverse_target_transform(values):
+    if torch.is_tensor(values):
+        clipped = torch.clamp(values, 1e-6, 1 - 1e-6)
+        z = torch.atanh(1 - 2 * clipped)
+        return torch.sign(z) * torch.pow(torch.abs(z), 4.0 / 3.0)
+
+    arr = np.asarray(values)
+    clipped = np.clip(arr, 1e-6, 1 - 1e-6)
+    z = np.arctanh(1 - 2 * clipped)
+    return np.sign(z) * (np.abs(z) ** (4.0 / 3.0))
 
 
 HORIZON_ORDER = ["1w", "4w", "13w", "26w", "52w"]
@@ -188,10 +221,14 @@ def infer_horizon_from_filename(path: str) -> str | None:
 def infer_timestamp_from_model(path: str) -> str | None:
     base = os.path.basename(path)
     name = os.path.splitext(base)[0]
-    parts = name.split("_")
 
-    if len(parts) >= 4 and parts[0] == "model" and parts[1] == "resnet":
-        return parts[-1]
+    match = re.search(r"(\d{8}_\d{6})", name)
+    if match:
+        return match.group(1)
+
+    parts = name.split("_")
+    if len(parts) >= 2 and parts[-2].isdigit() and len(parts[-2]) == 8 and parts[-1].isdigit():
+        return f"{parts[-2]}_{parts[-1]}"
 
     return None
 
@@ -345,8 +382,6 @@ class TrainingThread(threading.Thread):
             device = torch.device("cuda:0" if use_gpu else "cpu")
             
             timestamp = self.params['timestamp']
-            continue_training = self.params.get('continue_training', False)
-            pretrained_models = self.params.get('pretrained_models', [])
             
             gc.collect()
             if use_gpu:
@@ -375,9 +410,8 @@ class TrainingThread(threading.Thread):
             weight_decay = self.params['weight_decay']
             use_sigmoid = self.params['use_sigmoid']
 
-            pretrained_models = self.params.get('pretrained_models', {})
-
             results = []
+            trained_models = []
 
             for task in target_tasks:
                 if self.stop_event.is_set():
@@ -386,39 +420,92 @@ class TrainingThread(threading.Thread):
 
                 horizon = task['horizon']
                 self.app.current_network_id = horizon
+                fold_tasks = task.get('folds', [])
+                if not fold_tasks:
+                    self.app.thread_safe_logger.log(f"Varování: Žádné foldy pro {horizon}, přeskočeno.")
+                    continue
 
-                pretrained_model = pretrained_models.get(horizon)
-                if continue_training and pretrained_model:
+                self.app.thread_safe_logger.log(
+                    f"\n--- Trénování horizontu {horizon} ({len(fold_tasks)} rolling foldů) ---"
+                )
+
+                last_fold = None
+                last_entry = None
+                last_meta_fold = None
+                last_meta_entry = None
+
+                for fold_task in fold_tasks:
+                    if self.stop_event.is_set():
+                        break
+
+                    fold_id = fold_task['fold_id']
+                    display_id = f"{horizon}/fold{fold_id}"
+                    file_tag = f"{horizon}_fold{fold_id}"
+                    has_meta = len(fold_task['meta_train_X']) > 0 and len(fold_task['meta_val_X']) > 0
+
                     self.app.thread_safe_logger.log(
-                        f"\n--- Pokračování tréninku horizontu {horizon} z modelu {os.path.basename(pretrained_model)} ---"
+                        f"\n--- Fold {fold_id}: trénink {display_id} ---"
+                    )
+
+                    train_outcome = self.train_single_model(
+                        network_id=horizon,
+                        display_id=display_id,
+                        file_tag=file_tag,
+                        X_train=fold_task['X_train'],
+                        y_train=fold_task['y_train'],
+                        X_val=fold_task['X_val'],
+                        y_val=fold_task['y_val'],
+                        meta_train_X=fold_task['meta_train_X'],
+                        meta_val_X=fold_task['meta_val_X'],
+                        meta_train_y=fold_task['meta_train_y'],
+                        meta_val_y=fold_task['meta_val_y'],
+                        timestamp=timestamp,
+                        batch_size=batch_size,
+                        epochs=epochs,
+                        patience=patience,
+                        device=device,
+                        use_mixed_precision=use_mixed_precision,
+                        use_augmentation=use_augmentation,
+                        noise_level=noise_level,
+                        mixup_prob=mixup_prob,
+                        learning_rate=learning_rate,
+                        weight_decay=weight_decay,
+                        use_sigmoid=use_sigmoid,
+                        dropout_rate=dropout_rate,
+                        scheduler_type=scheduler_type,
+                        min_lr=min_lr,
+                        output_dim=1,
+                        run_meta=has_meta,
+                    )
+
+                    if self.stop_event.is_set():
+                        break
+
+                    last_fold = fold_id
+                    last_entry = train_outcome
+                    if train_outcome.get('meta_state') is not None:
+                        last_meta_fold = fold_id
+                        last_meta_entry = train_outcome
+
+                if self.stop_event.is_set():
+                    break
+
+                if not last_entry:
+                    self.app.thread_safe_logger.log(f"Varování: {horizon} nemá žádný úspěšný fold.")
+                    continue
+
+                self.app.thread_safe_logger.log(
+                    f"Používám poslední fold pro {horizon}: {last_fold} (val_loss {last_entry.get('val_loss', float('inf')):.6f})"
+                )
+                if last_meta_entry is not None:
+                    self.app.thread_safe_logger.log(
+                        f"Metasíť pro {horizon} beru z posledního foldu s meta: {last_meta_fold} "
+                        f"(meta_val_loss {last_meta_entry.get('meta_val_loss', float('inf')):.6f})"
                     )
                 else:
-                    self.app.thread_safe_logger.log(f"\n--- Trénování nového horizontu {horizon} ---")
-
-                val_loss = self.train_single_model(
-                    network_id=horizon,
-                    X_train=task['X_train'],
-                    y_train=task['y_train'],
-                    X_val=task['X_val'],
-                    y_val=task['y_val'],
-                    timestamp=timestamp,
-                    batch_size=batch_size,
-                    epochs=epochs,
-                    patience=patience,
-                    device=device,
-                    use_mixed_precision=use_mixed_precision,
-                    use_augmentation=use_augmentation,
-                    noise_level=noise_level,
-                    mixup_prob=mixup_prob,
-                    learning_rate=learning_rate,
-                    weight_decay=weight_decay,
-                    use_sigmoid=use_sigmoid,
-                    dropout_rate=dropout_rate,
-                    scheduler_type=scheduler_type,
-                    min_lr=min_lr,
-                    pretrained_model=pretrained_model,
-                    output_dim=1
-                )
+                    self.app.thread_safe_logger.log(
+                        f"Metasíť pro {horizon} nebyla v žádném foldu vytrénována."
+                    )
 
                 if self.stop_event.is_set():
                     break
@@ -428,8 +515,9 @@ class TrainingThread(threading.Thread):
                         'timestamp': timestamp,
                         'model_type': 'resnet',
                         'horizon': horizon,
-                        'val_loss': val_loss,
-                        'continued_training': continue_training,
+                        'val_loss': last_entry.get('val_loss', float('inf')),
+                        'meta_val_loss': (last_meta_entry or last_entry).get('meta_val_loss'),
+                        'best_fold': last_fold,
                         'epochs': epochs,
                         'batch_size': batch_size,
                         'learning_rate': learning_rate,
@@ -443,6 +531,13 @@ class TrainingThread(threading.Thread):
                         'seed': seed,
                     }
                 )
+                if last_meta_entry is not None and last_meta_entry is not last_entry:
+                    merged_entry = dict(last_entry)
+                    merged_entry['meta_state'] = last_meta_entry.get('meta_state')
+                    merged_entry['meta_val_loss'] = last_meta_entry.get('meta_val_loss')
+                    trained_models.append(merged_entry)
+                else:
+                    trained_models.append(last_entry)
 
             if not self.stop_event.is_set():
                 self.app.thread_safe_logger.log(f"\n=== Trénink dokončen (ID: {timestamp}) ===")
@@ -463,6 +558,34 @@ class TrainingThread(threading.Thread):
                 except Exception as e:
                     self.app.thread_safe_logger.log(f"Varování: Chyba při ukládání výsledků: {str(e)}")
 
+                try:
+                    bundle = {
+                        'bundle_type': 'training_bundle',
+                        'timestamp': timestamp,
+                        'use_sigmoid': use_sigmoid,
+                        'models': {},
+                    }
+
+                    for entry in trained_models:
+                        if not entry or not entry.get('horizon'):
+                            continue
+                        bundle['models'][entry['horizon']] = {
+                            'model_state': entry.get('model_state'),
+                            'meta_state': entry.get('meta_state'),
+                            'val_loss': entry.get('val_loss'),
+                            'meta_val_loss': entry.get('meta_val_loss'),
+                            'output_dim': entry.get('output_dim', 1),
+                            'input_dim': entry.get('input_dim'),
+                        }
+
+                    bundle_file = f"models_bundle_{timestamp}.pt"
+                    torch.save(bundle, bundle_file)
+                    self.app.thread_safe_logger.log(
+                        f"Modely a metasítě z běhu {timestamp} uloženy do '{bundle_file}'."
+                    )
+                except Exception as e:
+                    self.app.thread_safe_logger.log(f"Varování: Nepodařilo se uložit bundle modelů: {e}")
+
             self.app.root.after(0, self.app.enable_buttons)
             
         except Exception as e:
@@ -471,15 +594,15 @@ class TrainingThread(threading.Thread):
             self.app.thread_safe_logger.log(error_msg)
             self.app.root.after(0, self.app.enable_buttons)
     
-    def train_single_model(self, network_id, X_train, y_train, X_val, y_val, timestamp,
-                           batch_size, epochs, patience, device, use_mixed_precision=False,
-                           use_augmentation=False, noise_level=0.03, mixup_prob=0.2,
-                           learning_rate=0.001, weight_decay=0.0001, use_sigmoid=True,
+    def train_single_model(self, network_id, X_train, y_train, X_val, y_val, meta_train_X, meta_val_X,
+                           meta_train_y, meta_val_y, timestamp, batch_size, epochs, patience, device,
+                           use_mixed_precision=False, use_augmentation=False, noise_level=0.03,
+                           mixup_prob=0.2, learning_rate=0.001, weight_decay=0.0001, use_sigmoid=True,
                            dropout_rate=0.25, scheduler_type='cosine', min_lr='1e-6',
-                           pretrained_model=None, output_dim=3):
+                           output_dim=3, display_id=None, file_tag=None, run_meta=True):
         try:
             if self.stop_event.is_set():
-                return float('inf')
+                return {'horizon': network_id, 'val_loss': float('inf'), 'meta_val_loss': None}
                 
             gc.collect()
             if device.type == 'cuda':
@@ -489,18 +612,8 @@ class TrainingThread(threading.Thread):
                 mem_allocated = torch.cuda.memory_allocated() / 1024**2
                 self.app.thread_safe_logger.log(f"GPU využití před tréninkem: {mem_allocated:.1f}MB")
             
-            if pretrained_model:
-                pretrained_state = torch.load(pretrained_model, map_location='cpu')
-                inferred_dim = infer_output_dim_from_state_dict(pretrained_state)
-                if inferred_dim != output_dim:
-                    self.app.thread_safe_logger.log(
-                        f"Upravena výstupní dimenze na {inferred_dim} podle checkpointu {os.path.basename(pretrained_model)}"
-                    )
-                    output_dim = inferred_dim
-                    if y_train.shape[1] != output_dim:
-                        raise ValueError(
-                            f"Checkpoint očekává {output_dim} cílových sloupců, ale dataset má {y_train.shape[1]}"
-                        )
+            display_id = display_id or network_id
+            file_tag = file_tag or network_id
 
             if use_augmentation:
                 train_dataset = FinancialDataset(X_train, y_train, transform=True,
@@ -537,11 +650,6 @@ class TrainingThread(threading.Thread):
                 output_dim=output_dim
             )
             
-            # Načtení předtrénovaného modelu, pokud je k dispozici
-            if pretrained_model:
-                self.app.thread_safe_logger.log(f"Načítání vah z modelu: {os.path.basename(pretrained_model)}")
-                model.load_state_dict(pretrained_state)
-                
             model.to(device)
             
             activation = "Sigmoid" if use_sigmoid else "LeakyReLU"
@@ -563,18 +671,21 @@ class TrainingThread(threading.Thread):
             
             criterion = nn.MSELoss()
             
-            logger = TrainingLogger(self.app.thread_safe_logger, network_id, patience=patience)
+            logger = TrainingLogger(self.app.thread_safe_logger, display_id, patience=patience)
             logger.start_training()
-            self.app.training_loggers[str(network_id)] = logger
+            self.app.training_loggers[str(display_id)] = logger
+            self.app.root.after(0, lambda: self.app.add_network_option(display_id))
             
             scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
             
             best_val_loss = float('inf')
             best_model_state = None
+            meta_state = None
+            meta_val_loss = None
             
             for epoch in range(epochs):
                 if self.stop_event.is_set():
-                    self.app.thread_safe_logger.log(f"Trénink sítě {network_id} přerušen.")
+                    self.app.thread_safe_logger.log(f"Trénink sítě {display_id} přerušen.")
                     break
                 
                 model.train()
@@ -670,44 +781,51 @@ class TrainingThread(threading.Thread):
                 
                 if epoch % 5 == 0:
                     plot_data = logger.get_plotting_data()
-                    self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(network_id), plot_data))
+                    self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(display_id), plot_data))
             
             if self.stop_event.is_set():
-                return float('inf')
+                return {'horizon': network_id, 'val_loss': float('inf'), 'meta_val_loss': None}
 
             logger.finish()
 
-            model_file = f"model_resnet_{network_id}_{timestamp}.pt"
-            uncertainty_file = f"uncertainty_{os.path.splitext(model_file)[0]}.npy"
-
-            # Kalibrace šumu na základě validačních reziduí
             model.load_state_dict(best_model_state)
             model.to(device)
             model.eval()
 
-            residuals = []
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs = inputs.to(device, non_blocking=True)
-                    targets = targets.to(device, non_blocking=True)
-                    outputs = model(inputs)
-                    residuals.append((outputs - targets).cpu())
+            self.app.thread_safe_logger.log(f"Síť {display_id} dokončena. Nejlepší validační ztráta: {best_val_loss:.6f}")
 
-            if residuals:
-                residuals_cat = torch.cat(residuals)
-                residual_std = residuals_cat.std(dim=0).numpy()
-                np.save(uncertainty_file, residual_std)
+            try:
+                if not run_meta or len(meta_train_X) == 0 or len(meta_val_X) == 0:
+                    self.app.thread_safe_logger.log(
+                        f"Metasíť pro {display_id} přeskočena: není k dispozici meta segment."
+                    )
+                else:
+                    meta_val_loss, meta_state = self.train_meta_model(
+                        display_id,
+                        timestamp,
+                        model_state=best_model_state,
+                        X_train=meta_train_X,
+                        y_train=meta_train_y,
+                        X_val=meta_val_X,
+                        y_val=meta_val_y,
+                        batch_size=batch_size,
+                        device=device,
+                        use_mixed_precision=use_mixed_precision,
+                        dropout_rate=dropout_rate,
+                        use_sigmoid=use_sigmoid,
+                        file_tag=file_tag,
+                    )
+                    if meta_state is not None:
+                        self.app.thread_safe_logger.log(
+                            f"Metasíť pro {display_id} dokončena. Nejlepší validační ztráta: {meta_val_loss:.6f}"
+                        )
+            except Exception as exc:
                 self.app.thread_safe_logger.log(
-                    f"Odhad nejistoty uložen jako '{uncertainty_file}'"
+                    f"Varování: trénink metasítě pro {display_id} selhal: {exc}"
                 )
 
-            torch.save(best_model_state, model_file)
-
-            self.app.thread_safe_logger.log(f"Síť {network_id} dokončena. Nejlepší validační ztráta: {best_val_loss:.6f}")
-            self.app.thread_safe_logger.log(f"Model uložen jako '{model_file}'")
-            
             plot_data = logger.get_plotting_data()
-            self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(network_id), plot_data))
+            self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(display_id), plot_data))
             
             del model, optimizer, criterion
             if scaler is not None:
@@ -716,14 +834,196 @@ class TrainingThread(threading.Thread):
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            
-            return best_val_loss
-            
+
+            return {
+                'horizon': network_id,
+                'val_loss': best_val_loss,
+                'meta_val_loss': meta_val_loss,
+                'model_state': best_model_state,
+                'meta_state': meta_state,
+                'output_dim': output_dim,
+                'input_dim': X_train.shape[1],
+            }
+
         except Exception as e:
             import traceback
-            error_msg = f"CHYBA při tréninku sítě {network_id}: {str(e)}\n{traceback.format_exc()}"
+            error_msg = f"\nCHYBA při tréninku sítě {network_id}: {str(e)}\n{traceback.format_exc()}"
             self.app.thread_safe_logger.log(error_msg)
-            return float('inf')
+            return {'horizon': network_id, 'val_loss': float('inf'), 'meta_val_loss': None}
+
+    def train_meta_model(
+        self,
+        network_id,
+        timestamp,
+        model_state,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        batch_size,
+        device,
+        use_mixed_precision,
+        dropout_rate,
+        use_sigmoid,
+        file_tag=None,
+    ):
+        try:
+            base_model = EfficientResNet(
+                X_train.shape[1],
+                hidden_dims=scaled_hidden_dims(X_train.shape[1]),
+                dropout_rate=dropout_rate,
+                use_sigmoid=use_sigmoid,
+                output_dim=1,
+            )
+            base_model.load_state_dict(model_state)
+            base_model.to(device)
+            base_model.eval()
+
+            def build_meta_parts(features: torch.Tensor, targets: torch.Tensor):
+                with torch.no_grad():
+                    preds = base_model(features.to(device, non_blocking=True))
+                    preds_raw = inverse_target_transform(preds).cpu()
+                target_raw = inverse_target_transform(targets).cpu()
+                meta_inputs = torch.cat([features.cpu(), preds_raw], dim=1)
+                meta_targets = torch.abs(preds_raw - target_raw)
+                return meta_inputs, meta_targets
+
+            train_meta_X, train_meta_y = build_meta_parts(X_train, y_train)
+            val_meta_X, val_meta_y = build_meta_parts(X_val, y_val)
+
+            meta_model = ErrorEstimator(
+                train_meta_X.shape[1],
+                hidden_dims=scaled_hidden_dims(train_meta_X.shape[1]),
+                dropout_rate=dropout_rate * 0.5,
+            )
+            meta_model.to(device)
+
+            optimizer = torch.optim.AdamW(meta_model.parameters(), lr=1e-3, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
+            criterion = nn.MSELoss()
+            scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
+
+            train_loader = DataLoader(
+                TensorDataset(train_meta_X, train_meta_y),
+                batch_size=batch_size,
+                shuffle=True,
+            )
+            val_loader = DataLoader(
+                TensorDataset(val_meta_X, val_meta_y),
+                batch_size=batch_size * 2,
+                shuffle=False,
+            )
+
+            best_val_loss = float('inf')
+            best_state = None
+            patience = 20
+            patience_counter = 0
+            meta_epochs = 150
+
+            meta_logger_id = f"{network_id}-meta"
+            logger = TrainingLogger(self.app.thread_safe_logger, meta_logger_id, patience=patience)
+            logger.start_training()
+            self.app.training_loggers[str(meta_logger_id)] = logger
+            self.app.root.after(0, lambda: self.app.add_network_option(meta_logger_id))
+
+            for epoch in range(meta_epochs):
+                if self.stop_event.is_set():
+                    break
+
+                meta_model.train()
+                train_loss = 0.0
+
+                for inputs, targets in train_loader:
+                    inputs = inputs.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
+
+                    optimizer.zero_grad()
+
+                    if use_mixed_precision:
+                        with torch.cuda.amp.autocast():
+                            outputs = meta_model(inputs)
+                            loss = criterion(outputs, targets)
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(meta_model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        outputs = meta_model(inputs)
+                        loss = criterion(outputs, targets)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(meta_model.parameters(), 1.0)
+                        optimizer.step()
+
+                    train_loss += loss.item() * inputs.size(0)
+
+                train_loss /= len(train_loader.dataset)
+
+                meta_model.eval()
+                val_loss = 0.0
+                val_outputs = []
+                val_targets = []
+                with torch.no_grad():
+                    for inputs, targets in val_loader:
+                        inputs = inputs.to(device, non_blocking=True)
+                        targets = targets.to(device, non_blocking=True)
+
+                        if use_mixed_precision:
+                            with torch.cuda.amp.autocast():
+                                outputs = meta_model(inputs)
+                                loss = criterion(outputs, targets)
+                        else:
+                            outputs = meta_model(inputs)
+                            loss = criterion(outputs, targets)
+
+                        val_loss += loss.item() * inputs.size(0)
+                        val_outputs.append(outputs.cpu())
+                        val_targets.append(targets.cpu())
+
+                val_loss /= len(val_loader.dataset)
+                scheduler.step()
+                val_outputs_cat = torch.cat(val_outputs)
+                val_targets_cat = torch.cat(val_targets)
+                mse = F.mse_loss(val_outputs_cat, val_targets_cat).item()
+                rmse = np.sqrt(mse)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state = {k: v.cpu() for k, v in meta_model.state_dict().items()}
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                logger.log(epoch, meta_epochs, train_loss, val_loss, optimizer.param_groups[0]['lr'], rmse)
+
+                if patience_counter >= patience:
+                    break
+
+                if epoch % 5 == 0:
+                    plot_data = logger.get_plotting_data()
+                    self.app.root.after(0, lambda: self.app.update_plot_from_thread(str(meta_logger_id), plot_data))
+
+            if best_state is not None:
+                meta_model.load_state_dict(best_state)
+
+            logger.finish()
+
+            del base_model, meta_model, optimizer, criterion
+            if scaler is not None:
+                del scaler
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            final_state = best_state if best_state is not None else {k: v.cpu() for k, v in meta_model.state_dict().items()}
+            return best_val_loss, final_state
+
+        except Exception as e:
+            import traceback
+            error_msg = f"CHYBA při tréninku metasítě {network_id}: {str(e)}\n{traceback.format_exc()}"
+            self.app.thread_safe_logger.log(error_msg)
+            return float('inf'), None
 
 # Main application
 class NeuralNetApp:
@@ -740,7 +1040,6 @@ class NeuralNetApp:
         self.use_mixed_precision = tk.BooleanVar(value=torch.cuda.is_available())
         self.use_augmentation = tk.BooleanVar(value=True)
         self.use_sigmoid = tk.BooleanVar(value=True)
-        self.randomize = tk.BooleanVar(value=False)  # Přidáno - pro nový trénink od začátku
         self.training_columns = None
         self.training_loggers = {}
         self.best_models = {}
@@ -782,16 +1081,7 @@ class NeuralNetApp:
         ttk.Entry(file_frame, textvariable=self.output_file, width=50).grid(row=1, column=1, padx=5)
         ttk.Button(file_frame, text="Procházet", command=self.browse_output).grid(row=1, column=2, padx=5)
         
-        # Přidáno - frame pro načtení modelů
-        models_frame = ttk.LabelFrame(train_tab, text="Pokračování tréninku", padding=10)
-        models_frame.pack(fill=tk.X, pady=5)
-        
         self.loaded_models_var = tk.StringVar()
-        ttk.Label(models_frame, text="Načtené modely:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(models_frame, textvariable=self.loaded_models_var, width=50, state='readonly').grid(row=0, column=1, padx=5)
-        ttk.Button(models_frame, text="Načíst modely", command=self.load_models).grid(row=0, column=2, padx=5)
-        ttk.Checkbutton(models_frame, text="Začít trénink od začátku (ignorovat načtené modely)", 
-                     variable=self.randomize).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
         
         param_frame = ttk.LabelFrame(train_tab, text="Parametry trénování", padding=10)
         param_frame.pack(fill=tk.X, pady=5)
@@ -831,15 +1121,10 @@ class NeuralNetApp:
         self.dropout_rate.insert(0, "0.25")
         self.dropout_rate.grid(row=2, column=1, padx=5)
         
-        ttk.Label(param_frame, text="Val split:").grid(row=2, column=2, sticky=tk.W, pady=5, padx=(15,0))
-        self.val_split = ttk.Entry(param_frame, width=8)
-        self.val_split.insert(0, "0.2")
-        self.val_split.grid(row=2, column=3, padx=5)
-        
-        ttk.Label(param_frame, text="Random seed:").grid(row=2, column=4, sticky=tk.W, pady=5, padx=(15,0))
+        ttk.Label(param_frame, text="Random seed:").grid(row=2, column=2, sticky=tk.W, pady=5, padx=(15,0))
         self.random_seed = ttk.Entry(param_frame, width=8)
         self.random_seed.insert(0, "42")
-        self.random_seed.grid(row=2, column=5, padx=5)
+        self.random_seed.grid(row=2, column=3, padx=5)
         
         ttk.Checkbutton(param_frame, text="Použít GPU", 
                       variable=self.use_gpu).grid(row=3, column=0, sticky=tk.W, pady=5)
@@ -995,13 +1280,38 @@ class NeuralNetApp:
     def load_models(self):
         model_files = filedialog.askopenfilenames(filetypes=[("PyTorch model", "*.pt"), ("Všechny soubory", "*.*")])
         if model_files:
-            self.loaded_models = list(model_files)
-            self.loaded_models_var.set(f"Načteno {len(self.loaded_models)} modelů")
-            self.output_text.insert(tk.END, f"Načteno {len(self.loaded_models)} modelů.\n")
-            
-            # Vypíše načtené modely
-            for i, model in enumerate(self.loaded_models):
-                self.output_text.insert(tk.END, f"  {i+1}: {os.path.basename(model)}\n")
+            bundle_files = []
+            skipped = []
+            for path in model_files:
+                try:
+                    obj = torch.load(path, map_location='cpu')
+                except Exception:
+                    skipped.append(path)
+                    continue
+                if isinstance(obj, dict) and obj.get('bundle_type') == 'training_bundle':
+                    bundle_files.append(path)
+                else:
+                    skipped.append(path)
+
+            if not bundle_files:
+                self.loaded_models = []
+                self.loaded_models_var.set("Žádné bundle modely načteny")
+                self.output_text.insert(
+                    tk.END,
+                    "Nebyl nalezen žádný bundle modelů. Nahrajte soubor models_bundle_<timestamp>.pt.\n",
+                )
+            else:
+                self.loaded_models = bundle_files
+                self.loaded_models_var.set(f"Načteno {len(self.loaded_models)} bundle modelů")
+                self.output_text.insert(tk.END, f"Načteno {len(self.loaded_models)} bundle modelů.\n")
+                for i, model in enumerate(self.loaded_models):
+                    self.output_text.insert(tk.END, f"  {i+1}: {os.path.basename(model)}\n")
+
+            if skipped:
+                self.output_text.insert(
+                    tk.END,
+                    f"Přeskočeno {len(skipped)} souborů, které nejsou bundle modely.\n",
+                )
                 
         else:
             self.loaded_models = []
@@ -1009,32 +1319,6 @@ class NeuralNetApp:
             self.output_text.insert(tk.END, "Žádné modely nebyly načteny.\n")
         self.output_text.see(tk.END)
 
-    def load_validation_indices(self):
-        indices_map = {}
-
-        for model_path in self.loaded_models:
-            timestamp = infer_timestamp_from_model(model_path)
-            if not timestamp:
-                continue
-
-            candidate = f"val_indices_{timestamp}.pkl"
-            if not os.path.exists(candidate):
-                continue
-
-            try:
-                with open(candidate, "rb") as f:
-                    data = pickle.load(f)
-
-                if isinstance(data, dict):
-                    indices_map = {k: np.array(v) for k, v in data.items()}
-                    self.output_text.insert(tk.END, f"Načteny validační indexy z '{candidate}'.\n")
-                    break
-            except Exception as e:
-                self.output_text.insert(tk.END, f"Varování: Nepodařilo se načíst validační indexy: {e}\n")
-
-        self.output_text.see(tk.END)
-        return indices_map
-    
     def clear_log(self):
         self.output_text.delete(1.0, tk.END)
         self.output_text.insert(tk.END, "Log vymazán.\n")
@@ -1074,6 +1358,16 @@ class NeuralNetApp:
             
             self.figure.tight_layout()
             self.canvas.draw()
+
+    def add_network_option(self, network_id):
+        if not network_id:
+            return
+        current_values = list(self.network_selector["values"]) if self.network_selector["values"] else []
+        if network_id not in current_values:
+            current_values.append(network_id)
+            self.network_selector["values"] = current_values
+            if not self.network_selector.get():
+                self.network_selector.set(network_id)
     
     def update_visualization(self, event=None):
         selected_network = self.network_selector.get()
@@ -1114,12 +1408,7 @@ class NeuralNetApp:
             
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             
-            continue_training = (len(self.loaded_models) > 0) and not self.randomize.get()
-            
-            if continue_training:
-                self.output_text.insert(tk.END, f"Pokračování tréninku s {len(self.loaded_models)} načtenými modely\n")
-            else:
-                self.output_text.insert(tk.END, "Začátek nového tréninku\n")
+            self.output_text.insert(tk.END, "Začátek nového tréninku\n")
             
             self.output_text.insert(tk.END, "Načítání dat...\n")
             self.output_text.see(tk.END)
@@ -1161,7 +1450,6 @@ class NeuralNetApp:
                 noise_level = float(self.noise_level.get())
                 mixup_prob = float(self.mixup_prob.get())
                 patience = int(self.patience.get())
-                val_split = float(self.val_split.get())
                 scheduler_type = self.scheduler_type.get()
                 min_lr = self.min_lr.get()
                 use_gpu = torch.cuda.is_available() and self.use_gpu.get()
@@ -1172,9 +1460,18 @@ class NeuralNetApp:
 
                 column_mapping = map_columns_to_horizons(y_df.columns)
                 target_tasks = []
-                val_indices_to_save = {}
 
-                saved_val_indices = self.load_validation_indices() if continue_training else {}
+                def build_rolling_folds(indices, num_splits=10):
+                    segments = np.array_split(indices, num_splits)
+                    folds = []
+                    for fold_idx in range(num_splits - 1):
+                        train_idx = np.concatenate(segments[:fold_idx + 1]) if segments[:fold_idx + 1] else np.array([], dtype=int)
+                        val_idx = segments[fold_idx + 1]
+                        if len(train_idx) == 0 or len(val_idx) == 0:
+                            continue
+                        meta_idx = segments[fold_idx + 2] if (fold_idx + 2) < num_splits else np.array([], dtype=int)
+                        folds.append((fold_idx + 1, train_idx, val_idx, meta_idx))
+                    return folds
 
                 for horizon in HORIZON_ORDER:
                     column = column_mapping.get(horizon)
@@ -1187,37 +1484,50 @@ class NeuralNetApp:
 
                     horizon_indices = np.nonzero(mask.values)[0]
                     y_values = series.values.reshape(-1, 1)
+                    folds = build_rolling_folds(horizon_indices, num_splits=10)
+                    if not folds:
+                        self.output_text.insert(tk.END, f"Varování: Pro {horizon} není možné vytvořit rolling split.\n")
+                        continue
 
-                    preset_val_idx = saved_val_indices.get(horizon)
-                    if preset_val_idx is not None:
-                        preset_val_idx = [idx for idx in preset_val_idx if idx < len(X_scaled)]
-                        train_idx = [idx for idx in horizon_indices if idx not in preset_val_idx]
-                        val_idx = preset_val_idx
-                        if not val_idx:
-                            self.output_text.insert(tk.END, f"Varování: Žádné uložené validační indexy pro {horizon}, provádím nový split.\n")
-                            train_idx, val_idx = train_test_split(
-                                horizon_indices, test_size=val_split, random_state=seed
-                            )
-                        else:
-                            self.output_text.insert(tk.END, f"Používám uložené validační indexy pro {horizon}.\n")
-                    else:
-                        train_idx, val_idx = train_test_split(
-                            horizon_indices, test_size=val_split, random_state=seed
+                    fold_tasks = []
+                    for fold_id, train_idx, val_idx, meta_idx in folds:
+                        meta_train_idx = np.array([], dtype=int)
+                        meta_val_idx = np.array([], dtype=int)
+                        if len(meta_idx) >= 2:
+                            split_point = int(len(meta_idx) * 0.8)
+                            split_point = max(1, min(split_point, len(meta_idx) - 1))
+                            meta_train_idx = meta_idx[:split_point]
+                            meta_val_idx = meta_idx[split_point:]
+
+                        X_train = X_scaled[train_idx]
+                        X_val = X_scaled[val_idx]
+                        y_train = y_values[train_idx]
+                        y_val = y_values[val_idx]
+
+                        meta_train = X_scaled[meta_train_idx] if len(meta_train_idx) > 0 else np.empty((0, X_scaled.shape[1]))
+                        meta_val = X_scaled[meta_val_idx] if len(meta_val_idx) > 0 else np.empty((0, X_scaled.shape[1]))
+                        meta_train_targets = y_values[meta_train_idx] if len(meta_train_idx) > 0 else np.empty((0, 1))
+                        meta_val_targets = y_values[meta_val_idx] if len(meta_val_idx) > 0 else np.empty((0, 1))
+
+                        fold_tasks.append(
+                            {
+                                'fold_id': fold_id,
+                                'X_train': torch.FloatTensor(X_train),
+                                'y_train': torch.FloatTensor(y_train),
+                                'X_val': torch.FloatTensor(X_val),
+                                'y_val': torch.FloatTensor(y_val),
+                                'meta_train_X': torch.FloatTensor(meta_train),
+                                'meta_val_X': torch.FloatTensor(meta_val),
+                                'meta_train_y': torch.FloatTensor(meta_train_targets),
+                                'meta_val_y': torch.FloatTensor(meta_val_targets),
+                            }
                         )
 
-                    val_indices_to_save[horizon] = np.array(val_idx)
-                    X_train = X_scaled[train_idx]
-                    X_val = X_scaled[val_idx]
-                    y_train = y_values[train_idx]
-                    y_val = y_values[val_idx]
-
+                    self.output_text.insert(tk.END, f"{horizon}: rolling split vytvořen s {len(fold_tasks)} foldy.\n")
                     target_tasks.append(
                         {
                             'horizon': horizon,
-                            'X_train': torch.FloatTensor(X_train),
-                            'y_train': torch.FloatTensor(y_train),
-                            'X_val': torch.FloatTensor(X_val),
-                            'y_val': torch.FloatTensor(y_val),
+                            'folds': fold_tasks,
                         }
                     )
 
@@ -1229,12 +1539,6 @@ class NeuralNetApp:
                     self.enable_buttons()
                     return
 
-                if val_indices_to_save:
-                    val_index_file = f"val_indices_{timestamp}.pkl"
-                    with open(val_index_file, "wb") as f:
-                        pickle.dump(val_indices_to_save, f)
-                    self.output_text.insert(tk.END, f"Validační indexy uloženy do '{val_index_file}'.\n")
-
                 self.output_text.insert(
                     tk.END,
                     f"K tréninku připraveno {len(target_tasks)} horizontů: {', '.join(task['horizon'] for task in target_tasks)}\n",
@@ -1244,13 +1548,6 @@ class NeuralNetApp:
                 self.network_selector['values'] = network_ids
                 if network_ids:
                     self.network_selector.current(0)
-
-                pretrained_map = {}
-                if continue_training:
-                    for path in self.loaded_models:
-                        horizon = infer_horizon_from_filename(path)
-                        if horizon:
-                            pretrained_map[horizon] = path
 
                 params = {
                     'seed': seed,
@@ -1270,8 +1567,6 @@ class NeuralNetApp:
                     'learning_rate': learning_rate,
                     'timestamp': timestamp,
                     'target_tasks': target_tasks,
-                    'continue_training': continue_training,
-                    'pretrained_models': pretrained_map,
                 }
 
                 self.training_thread = TrainingThread(self, params)
@@ -1317,14 +1612,14 @@ class NeuralNetApp:
             if self.loaded_models:
                 models_to_use = self.loaded_models
                 if len(models_to_use) > 1:
-                    self.output_text.insert(tk.END, "Načteno více modelů, pro simulace bude použit první.\n")
+                    self.output_text.insert(tk.END, "Načteno více bundle modelů, pro predikci bude použit první.\n")
                 else:
-                    self.output_text.insert(tk.END, "Používám načtený model.\n")
+                    self.output_text.insert(tk.END, "Používám načtený bundle model.\n")
             elif specific_model_path and os.path.exists(specific_model_path):
                 models_to_use = [specific_model_path]
-                self.output_text.insert(tk.END, f"Používám konkrétní model: {specific_model_path}\n")
+                self.output_text.insert(tk.END, f"Používám konkrétní bundle model: {specific_model_path}\n")
             else:
-                messagebox.showerror("Chyba", "Nejsou načteny žádné modely ani vybrán konkrétní model!")
+                messagebox.showerror("Chyba", "Nejsou načteny žádné bundle modely ani vybrán konkrétní soubor!")
                 return
 
             scaler_files = [f for f in os.listdir('.') if f.startswith('scaler_') and f.endswith('.pkl')]
@@ -1382,24 +1677,60 @@ class NeuralNetApp:
                     torch.cuda.synchronize()
 
                 horizon_models = {}
-                for path in models_to_use:
-                    horizon = infer_horizon_from_filename(path)
-                    if horizon:
-                        horizon_models[horizon] = path
+                meta_model_states = {}
+
+                def load_bundle(path: str):
+                    try:
+                        obj = torch.load(path, map_location='cpu')
+                    except Exception:
+                        return None
+                    if isinstance(obj, dict) and obj.get('bundle_type') == 'training_bundle':
+                        return obj
+                    return None
+
+                bundle_timestamp = None
+                effective_use_sigmoid = self.use_sigmoid.get()
+                if len(models_to_use) != 1:
+                    messagebox.showerror("Chyba", "Pro predikci lze použít pouze jeden bundle model.")
+                    return
+
+                bundle = load_bundle(models_to_use[0])
+                if not bundle:
+                    messagebox.showerror("Chyba", "Vybraný soubor není bundle modelů (models_bundle_<timestamp>.pt).")
+                    return
+
+                bundle_timestamp = bundle.get('timestamp') or infer_timestamp_from_model(models_to_use[0])
+                effective_use_sigmoid = bundle.get('use_sigmoid', effective_use_sigmoid)
+                for horizon, payload in bundle.get('models', {}).items():
+                    horizon_models[horizon] = payload.get('model_state') or payload
+                    if payload.get('meta_state') is not None:
+                        meta_model_states[horizon] = payload['meta_state']
+                self.output_text.insert(tk.END, f"Načten bundle modelů s {len(horizon_models)} sítěmi.\n")
 
                 num_rows = X_predict_tensor.shape[0]
 
-                def inverse_target_transform(values: np.ndarray) -> np.ndarray:
-                    clipped = np.clip(values, 1e-6, 1 - 1e-6)
-                    z = np.arctanh(1 - 2 * clipped)
-                    return np.sign(z) * (np.abs(z) ** (4.0 / 3.0))
+                self.output_text.insert(
+                    tk.END,
+                    "Dropout během predikce je vypnutý, používám deterministické výstupy a metasíť pro odhad chyby.\n",
+                )
 
-                try:
-                    num_prediction_samples = max(1, int(self.pred_samples.get()))
-                except Exception:
-                    num_prediction_samples = 50
+                def predict_with_model(model_path, output_dim: int) -> np.ndarray:
+                    state_dict = torch.load(model_path, map_location='cpu') if isinstance(model_path, str) else model_path
+                    inferred_dim = infer_output_dim_from_state_dict(state_dict)
+                    if inferred_dim != output_dim:
+                        output_dim = inferred_dim
 
-                def run_single_pass(active_model):
+                    model = EfficientResNet(
+                        X_predict_scaled.shape[1],
+                        hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1]),
+                        use_sigmoid=effective_use_sigmoid,
+                        output_dim=output_dim
+                    )
+
+                    model.load_state_dict(state_dict)
+                    model.to(device)
+                    model.eval()
+
                     pass_predictions = []
                     with torch.no_grad():
                         for start in range(0, num_rows, batch_size):
@@ -1408,90 +1739,65 @@ class NeuralNetApp:
 
                             if use_mixed_precision:
                                 with torch.cuda.amp.autocast():
-                                    batch_predictions = active_model(batch_data).cpu().numpy()
+                                    batch_predictions = model(batch_data)
                             else:
-                                batch_predictions = active_model(batch_data).cpu().numpy()
+                                batch_predictions = model(batch_data)
 
-                            pass_predictions.append(batch_predictions)
+                            pass_predictions.append(batch_predictions.cpu())
 
-                    return np.vstack(pass_predictions)
+                    stacked = torch.cat(pass_predictions)
+                    return inverse_target_transform(stacked).cpu().numpy()
 
-                def predict_with_model(model_path: str, output_dim: int) -> tuple[np.ndarray, np.ndarray]:
-                    state_dict = torch.load(model_path, map_location='cpu')
-                    inferred_dim = infer_output_dim_from_state_dict(state_dict)
-                    if inferred_dim != output_dim:
-                        output_dim = inferred_dim
+                def predict_meta_errors(meta_model_path, base_predictions: np.ndarray) -> np.ndarray:
+                    state_dict = torch.load(meta_model_path, map_location='cpu') if isinstance(meta_model_path, str) else meta_model_path
+                    meta_model = ErrorEstimator(
+                        X_predict_scaled.shape[1] + 1,
+                        hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1] + 1),
+                        dropout_rate=float(self.dropout_rate.get()) * 0.5,
+                    )
+                    meta_model.load_state_dict(state_dict)
+                    meta_model.to(device)
+                    meta_model.eval()
 
-                    model = EfficientResNet(
-                        X_predict_scaled.shape[1],
-                        hidden_dims=scaled_hidden_dims(X_predict_scaled.shape[1]),
-                        use_sigmoid=self.use_sigmoid.get(),
-                        output_dim=output_dim
+                    meta_inputs = torch.cat(
+                        [
+                            X_predict_tensor,
+                            torch.as_tensor(base_predictions, dtype=torch.float32).reshape(-1, 1),
+                        ],
+                        dim=1,
                     )
 
-                    model.load_state_dict(state_dict)
-                    model.to(device)
-                    model.train()
-                    for module in model.modules():
-                        if isinstance(module, nn.BatchNorm1d):
-                            module.eval()
+                    meta_preds = []
+                    with torch.no_grad():
+                        for start in range(0, num_rows, batch_size):
+                            end = min(start + batch_size, num_rows)
+                            batch_data = meta_inputs[start:end].to(device, non_blocking=True)
 
-                    samples = []
-                    for _ in range(num_prediction_samples):
-                        samples.append(run_single_pass(model))
+                            if use_mixed_precision:
+                                with torch.cuda.amp.autocast():
+                                    batch_predictions = meta_model(batch_data)
+                            else:
+                                batch_predictions = meta_model(batch_data)
 
-                    sample_array = np.stack(samples)
-                    sample_array_raw = inverse_target_transform(sample_array)
-                    return sample_array_raw.mean(axis=0), sample_array_raw.std(axis=0)
+                            meta_preds.append(batch_predictions.cpu())
 
-                self.output_text.insert(
-                    tk.END,
-                    f"Monte Carlo dropout aktivní, generuji {num_prediction_samples} vzorků.\n"
-                )
+                    return torch.cat(meta_preds).numpy().reshape(-1)
 
                 results = {}
+                used_horizons = [h for h in HORIZON_ORDER if h in horizon_models]
+                for horizon in used_horizons:
+                    mean_preds = predict_with_model(horizon_models[horizon], 1).reshape(-1)
+                    results[f"mean_{horizon}"] = mean_preds
 
-                if horizon_models:
-                    used_horizons = [h for h in HORIZON_ORDER if h in horizon_models]
-                    for horizon in used_horizons:
-                        mean_preds, std_preds = predict_with_model(horizon_models[horizon], 1)
-                        results[f"mean_{horizon}"] = mean_preds.reshape(-1)
-                        results[f"std_{horizon}"] = std_preds.reshape(-1)
-                        gamma_mean = mean_preds.reshape(-1) + 1.0
-                        gamma_mode = np.where(
-                            gamma_mean > 1e-8,
-                            np.clip(
-                                gamma_mean - (std_preds.reshape(-1) ** 2) / gamma_mean,
-                                a_min=0.0,
-                                a_max=None,
-                            ),
-                            np.nan,
+                    meta_state = meta_model_states.get(horizon)
+                    if meta_state is not None:
+                        results[f"error_{horizon}"] = predict_meta_errors(meta_state, mean_preds)
+                    else:
+                        self.output_text.insert(
+                            tk.END,
+                            f"Nebyl nalezen meta-model pro horizont {horizon}, odhady chyby budou NaN.\n",
                         )
-                        results[f"gamma_mode_{horizon}"] = gamma_mode
-                else:
-                    fallback_model = models_to_use[0]
-                    mean_preds, std_preds = predict_with_model(fallback_model, 1)
-                    output_dim = mean_preds.shape[1] if mean_preds.ndim == 2 else 1
-                    horizons = HORIZON_ORDER[:output_dim]
-
-                    if mean_preds.ndim == 1:
-                        mean_preds = mean_preds.reshape(-1, 1)
-                        std_preds = std_preds.reshape(-1, 1)
-
-                    for j, horizon in enumerate(horizons):
-                        results[f"mean_{horizon}"] = mean_preds[:, j]
-                        results[f"std_{horizon}"] = std_preds[:, j]
-                        gamma_mean = mean_preds[:, j] + 1.0
-                        gamma_mode = np.where(
-                            gamma_mean > 1e-8,
-                            np.clip(
-                                gamma_mean - (std_preds[:, j] ** 2) / gamma_mean,
-                                a_min=0.0,
-                                a_max=None,
-                            ),
-                            np.nan,
-                        )
-                        results[f"gamma_mode_{horizon}"] = gamma_mode
+                        results[f"error_{horizon}"] = np.full_like(mean_preds, np.nan, dtype=float)
 
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
 
