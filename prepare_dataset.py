@@ -10,7 +10,7 @@ how the ticker performed 4, 13 and 26 weeks into the future.
 
 The mapping between Excel columns (1-based) and neural network nodes is defined
 below. When any required value is missing the entire row is discarded, with the
-exception of nodes 6–9 where the specification demands an explicit ``0``
+exception of nodes 8–9 where the specification demands an explicit ``0``
 fallback.
 
 For every snapshot that has the necessary neighbours the script:
@@ -303,11 +303,11 @@ def _compute_nodes(
         reciprocal(5),
         ratio(17, 80),
         reciprocal(7),
-        ratio(1, 80),
-        reciprocal_or_zero(9),
-        reciprocal_or_zero(10),
+        reciprocal(8),
+        reciprocal(9),
+        reciprocal(10),
         raw_or_zero(14),
-        raw_or_zero(14),
+        raw_or_zero(15),
         raw(18),
         raw(19),
         raw(20),
